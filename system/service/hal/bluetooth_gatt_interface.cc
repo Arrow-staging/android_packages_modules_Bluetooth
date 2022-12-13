@@ -93,12 +93,13 @@ void RegisterClientCallback(int status, int client_if,
       RegisterClientCallback(g_interface, status, client_if, app_uuid));
 }
 
-void ScanResultCallback(
-    uint16_t ble_evt_type, uint8_t addr_type, RawAddress* bda,
-    uint8_t ble_primary_phy, uint8_t ble_secondary_phy,
-    uint8_t ble_advertising_sid, int8_t ble_tx_power, int8_t rssi,
-    uint16_t ble_periodic_adv_int,
-    std::vector<uint8_t> adv_data) {  // NOLINT(pass-by-value)
+void ScanResultCallback(uint16_t ble_evt_type, uint8_t addr_type,
+                        RawAddress* bda, uint8_t ble_primary_phy,
+                        uint8_t ble_secondary_phy, uint8_t ble_advertising_sid,
+                        int8_t ble_tx_power, int8_t rssi,
+                        uint16_t ble_periodic_adv_int,
+                        std::vector<uint8_t> adv_data,
+                        RawAddress* original_bda) {  // NOLINT(pass-by-value)
   shared_lock<shared_mutex_impl> lock(g_instance_lock);
   VERIFY_INTERFACE_OR_RETURN();
   CHECK(bda);
@@ -442,6 +443,10 @@ class BluetoothGattInterfaceImpl : public BluetoothGattInterface {
  public:
   BluetoothGattInterfaceImpl() : hal_iface_(nullptr) {}
 
+  BluetoothGattInterfaceImpl(const BluetoothGattInterfaceImpl&) = delete;
+  BluetoothGattInterfaceImpl& operator=(const BluetoothGattInterfaceImpl&) =
+      delete;
+
   ~BluetoothGattInterfaceImpl() override {
     if (hal_iface_) hal_iface_->cleanup();
   }
@@ -535,8 +540,6 @@ class BluetoothGattInterfaceImpl : public BluetoothGattInterface {
   // The HAL handle obtained from the shared library. We hold a weak reference
   // to this since the actual data resides in the shared Bluetooth library.
   const btgatt_interface_t* hal_iface_;
-
-  DISALLOW_COPY_AND_ASSIGN(BluetoothGattInterfaceImpl);
 };
 
 namespace {

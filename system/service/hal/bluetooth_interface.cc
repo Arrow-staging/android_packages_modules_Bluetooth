@@ -38,6 +38,10 @@ using shared_mutex_impl = std::shared_mutex;
 using shared_mutex_impl = std::shared_timed_mutex;
 #endif
 
+#ifndef DYNAMIC_LOAD_BLUETOOTH
+extern bt_interface_t bluetoothInterface;
+#endif
+
 namespace bluetooth {
 namespace hal {
 
@@ -152,6 +156,11 @@ void AddressConsolidateCallback(RawAddress* main_bd_addr,
   // Do nothing
 }
 
+void LeAddressAssociateCallback(RawAddress* main_bd_addr,
+                                RawAddress* secondary_bd_addr) {
+  // Do nothing
+}
+
 void AclStateChangedCallback(bt_status_t status, RawAddress* remote_bd_addr,
                              bt_acl_state_t state, int transport_link_type,
                              bt_hci_error_code_t hci_reason) {
@@ -217,6 +226,23 @@ void LinkQualityReportCallback(uint64_t timestamp, int report_id, int rssi,
       packets_not_receive_count, negative_acknowledgement_count));
 }
 
+void SwitchBufferSizeCallback(bool is_low_latency_buffer_size) {
+  shared_lock<shared_mutex_impl> lock(g_instance_lock);
+  VERIFY_INTERFACE_OR_RETURN();
+  LOG(WARNING) << __func__ << " - is_low_latency_buffer_size: "
+               << is_low_latency_buffer_size;
+  FOR_EACH_BLUETOOTH_OBSERVER(
+      SwitchBufferSizeCallback(is_low_latency_buffer_size));
+}
+
+void SwitchCodecCallback(bool is_low_latency_buffer_size) {
+  shared_lock<shared_mutex_impl> lock(g_instance_lock);
+  VERIFY_INTERFACE_OR_RETURN();
+  LOG(WARNING) << __func__ << " - is_low_latency_buffer_size: "
+               << is_low_latency_buffer_size;
+  FOR_EACH_BLUETOOTH_OBSERVER(SwitchCodecCallback(is_low_latency_buffer_size));
+}
+
 // The HAL Bluetooth DM callbacks.
 bt_callbacks_t bt_callbacks = {
     sizeof(bt_callbacks_t),
@@ -229,13 +255,16 @@ bt_callbacks_t bt_callbacks = {
     SSPRequestCallback,
     BondStateChangedCallback,
     AddressConsolidateCallback,
+    LeAddressAssociateCallback,
     AclStateChangedCallback,
     ThreadEventCallback,
     nullptr, /* dut_mode_recv_cb */
     nullptr, /* le_test_mode_cb */
     nullptr, /* energy_info_cb */
     LinkQualityReportCallback,
-    nullptr /* generate_local_oob_data_cb */
+    nullptr /* generate_local_oob_data_cb */,
+    SwitchBufferSizeCallback,
+    SwitchCodecCallback,
 };
 
 bt_os_callouts_t bt_os_callouts = {sizeof(bt_os_callouts_t),
@@ -246,6 +275,12 @@ constexpr char kLibbluetooth[] = "libbluetooth.so";
 constexpr char kBluetoothInterfaceSym[] = "bluetoothInterface";
 
 int hal_util_load_bt_library_from_dlib(const bt_interface_t** interface) {
+#ifndef DYNAMIC_LOAD_BLUETOOTH
+  (void)kLibbluetooth;
+  (void)kBluetoothInterfaceSym;
+  *interface = &bluetoothInterface;
+  return 0;
+#else
   bt_interface_t* itf{nullptr};
 
   // Always try to load the default Bluetooth stack on GN builds.
@@ -277,6 +312,7 @@ error:
   if (handle) dlclose(handle);
 
   return -EINVAL;
+#endif
 }
 
 }  // namespace
@@ -285,6 +321,9 @@ error:
 class BluetoothInterfaceImpl : public BluetoothInterface {
  public:
   BluetoothInterfaceImpl() : hal_iface_(nullptr) {}
+
+  BluetoothInterfaceImpl(const BluetoothInterfaceImpl&) = delete;
+  BluetoothInterfaceImpl& operator=(const BluetoothInterfaceImpl&) = delete;
 
   ~BluetoothInterfaceImpl() override {
     if (hal_iface_) hal_iface_->cleanup();
@@ -320,7 +359,8 @@ class BluetoothInterfaceImpl : public BluetoothInterface {
 
     // Initialize the Bluetooth interface. Set up the adapter (Bluetooth DM) API
     // callbacks.
-    status = hal_iface_->init(&bt_callbacks, false, false, 0, nullptr, false);
+    status = hal_iface_->init(&bt_callbacks, false, false, 0, nullptr, false,
+                              nullptr);
     if (status != BT_STATUS_SUCCESS) {
       LOG(ERROR) << "Failed to initialize Bluetooth stack";
       return false;
@@ -347,8 +387,6 @@ class BluetoothInterfaceImpl : public BluetoothInterface {
   // The HAL handle obtained from the shared library. We hold a weak reference
   // to this since the actual data resides in the shared Bluetooth library.
   const bt_interface_t* hal_iface_;
-
-  DISALLOW_COPY_AND_ASSIGN(BluetoothInterfaceImpl);
 };
 
 namespace {
@@ -422,6 +460,16 @@ void BluetoothInterface::Observer::LinkQualityReportCallback(
     int /* snr */, int /* retransmission_count */,
     int /* packets_not_receive_count */,
     int /* negative_acknowledgement_count */) {
+  // Do nothing.
+}
+
+void BluetoothInterface::Observer::SwitchBufferSizeCallback(
+    bool /* is_low_latency_buffer_size */) {
+  // Do nothing.
+}
+
+void BluetoothInterface::Observer::SwitchCodecCallback(
+    bool /* is_low_latency_buffer_size */) {
   // Do nothing.
 }
 

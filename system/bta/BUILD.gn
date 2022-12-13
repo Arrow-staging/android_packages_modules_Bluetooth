@@ -42,6 +42,7 @@ static_library("bta") {
     "dm/bta_dm_pm.cc",
     "gatt/bta_gattc_act.cc",
     "gatt/bta_gattc_api.cc",
+    "gatt/bta_gattc_db_storage.cc",
     "gatt/bta_gattc_cache.cc",
     "gatt/bta_gattc_main.cc",
     "gatt/bta_gattc_utils.cc",
@@ -53,6 +54,11 @@ static_library("bta") {
     "gatt/database.cc",
     "gatt/database_builder.cc",
     "groups/groups.cc",
+    # TODO(abps) - Enable with long-term effort for LE Audio
+    #"has/has_client.cc",
+    #"has/has_ctp.cc",
+    #"has/has_preset.cc",
+    #"has/has_types.cc",
     "hearing_aid/hearing_aid.cc",
     "hearing_aid/hearing_aid_audio_source.cc",
     "hf_client/bta_hf_client_act.cc",
@@ -102,8 +108,6 @@ static_library("bta") {
     "//bt/system/linux_include",
     "//bt/system/bta",
     "//bt/system/internal_include",
-    "//bt/system/btcore/include",
-    "//bt/system/hci/include",
     "//bt/system/internal_include",
     "//bt/system/stack/include",
     "//bt/system/stack/btm",
@@ -123,6 +127,7 @@ static_library("bta") {
   ]
 
   deps = [
+    "//bt/system:libbt-platform-protos-lite",
     "//bt/system/gd/rust/shim:shim_bridge_header",
     "//bt/system/gd/rust/shim:init_flags_bridge_header",
     "//bt/system/gd/rust/shim:message_loop_thread_bridge_header",
@@ -142,8 +147,6 @@ if (use.test) {
       "include",
       "//bt/system/",
       "//bt/system/bta",
-      "//bt/system/btcore/include",
-      "//bt/system/hci/include",
       "//bt/system/internal_include",
       "//bt/system/stack/btm",
     ]

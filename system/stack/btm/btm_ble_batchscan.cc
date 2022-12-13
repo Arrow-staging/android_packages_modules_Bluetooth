@@ -58,7 +58,8 @@ bool can_do_batch_scan() {
 }
 
 /* VSE callback for batch scan, filter, and tracking events */
-void btm_ble_batchscan_filter_track_adv_vse_cback(uint8_t len, uint8_t* p) {
+void btm_ble_batchscan_filter_track_adv_vse_cback(uint8_t len,
+                                                  const uint8_t* p) {
   tBTM_BLE_TRACK_ADV_DATA adv_data;
 
   uint8_t sub_event = 0;
@@ -125,7 +126,7 @@ void btm_ble_batchscan_filter_track_adv_vse_cback(uint8_t len, uint8_t* p) {
 
     // Make sure the device is known
     BTM_SecAddBleDevice(adv_data.bd_addr, BT_DEVICE_TYPE_BLE,
-                        adv_data.addr_type);
+                        to_ble_addr_type(adv_data.addr_type));
 
     ble_advtrack_cb.p_track_cback(&adv_data);
     return;

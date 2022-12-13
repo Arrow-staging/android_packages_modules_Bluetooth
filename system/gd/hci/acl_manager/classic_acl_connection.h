@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include <atomic>
+#include <memory>
+
 #include "hci/acl_connection_interface.h"
 #include "hci/acl_manager/acl_connection.h"
 #include "hci/acl_manager/connection_management_callbacks.h"
@@ -30,6 +33,9 @@ class ClassicAclConnection : public AclConnection {
   ClassicAclConnection();
   ClassicAclConnection(std::shared_ptr<Queue> queue, AclConnectionInterface* acl_connection_interface, uint16_t handle,
                        Address address);
+  ClassicAclConnection(const ClassicAclConnection&) = delete;
+  ClassicAclConnection& operator=(const ClassicAclConnection&) = delete;
+
   ~ClassicAclConnection();
 
   virtual Address GetAddress() const {
@@ -72,7 +78,7 @@ class ClassicAclConnection : public AclConnection {
   virtual bool ReadRemoteExtendedFeatures(uint8_t page_number);
 
   // Called once before passing the connection to the client
-  virtual ConnectionManagementCallbacks* GetEventCallbacks();
+  virtual ConnectionManagementCallbacks* GetEventCallbacks(std::function<void(uint16_t)> invalidate_callbacks);
 
  private:
   AclConnectionInterface* acl_connection_interface_;
@@ -83,7 +89,6 @@ class ClassicAclConnection : public AclConnection {
  private:
   struct impl;
   struct impl* pimpl_ = nullptr;
-  DISALLOW_COPY_AND_ASSIGN(ClassicAclConnection);
 };
 
 }  // namespace acl_manager

@@ -24,17 +24,17 @@
 #
 #
 # Usage:
-# ./dump_le_audio.py BTSNOOP.cfa
+# ./dump_le_audio.py BTSNOOP.cfa [-v] [--header] [--ase_handle ASE_HANDLE]
 #
-# -v, --verbose to enable the verbose log
-# --header, Add the header for LC3 Conformance Interoperability Test Software V.1.0.3 from LC3 test specification.
+# -v, --verbose: to enable the verbose log
+# --header: Add the header for LC3 Conformance Interoperability Test Software V.1.0.3 from LC3 test specification.
+#  --ase_handle ASE_HANDLE: Set the ASE handle manually.
 #
 # NOTE:
 # Please make sure you HCI Snoop data file includes the following frames:
-# GATT service discovery for "ASE Control Point" chracteristic
-# GATT config codec via ASE Control Point
-# HCI create CIS to point out the "Start stream", and the data frames.
-# HCI remove ISO data path would trigger dump audio data once
+# 1. GATT service discovery for "ASE Control Point" chracteristic (if you give the ase_handle via command, the flow could be skipped)
+# 2. GATT config codec via ASE Control Point
+# 3. HCI create CIS to point out the "Start stream", and the data frames.
 # After all hci packet parse finished, would dump all remain audio data as well
 #
 # Correspondsing Spec.
@@ -117,6 +117,7 @@ AUDIO_LOCATION_CENTER = 0x04
 packet_number = 0
 debug_enable = False
 add_header = False
+ase_handle = 0xFFFF
 
 
 class Connection:
@@ -181,7 +182,7 @@ def generate_header(file, connection):
         }
         header = header + struct.pack("<H", sf_case[ase.sampling_frequencies])
         fd_case = {FRAME_DURATION_7_5: 7.5, FRAME_DURATION_10: 10}
-        header = header + struct.pack("<H", ase.octets_per_frame * 8 * 10 / fd_case[ase.frame_duration])
+        header = header + struct.pack("<H", int(ase.octets_per_frame * 8 * 10 / fd_case[ase.frame_duration]))
         al_case = {AUDIO_LOCATION_MONO: 1, AUDIO_LOCATION_LEFT: 1, AUDIO_LOCATION_RIGHT: 1, AUDIO_LOCATION_CENTER: 2}
         header = header + struct.pack("<HHHL", al_case[ase.channel_allocation], fd_case[ase.frame_duration] * 100, 0,
                                       48000000)
@@ -214,6 +215,10 @@ def parse_codec_information(connection_handle, ase_id, packet):
 
 def parse_att_read_by_type_rsp(packet, connection_handle):
     length, packet = unpack_data(packet, 1, False)
+    if length != 7:
+        #ignore the packet, we're only interested in this packet for the characteristic type UUID
+        return
+
     if length > len(packet):
         debug_print("Invalid att packet length")
         return
@@ -231,6 +236,10 @@ def parse_att_read_by_type_rsp(packet, connection_handle):
 
 def parse_att_write_cmd(packet, connection_handle, timestamp):
     attribute_handle, packet = unpack_data(packet, 2, False)
+    global ase_handle
+    if ase_handle != 0xFFFF:
+        connection_map[connection_handle].ase_handle = ase_handle
+
     if connection_map[connection_handle].ase_handle == attribute_handle:
         if debug_enable:
             debug_print("Action with ASE Control point")
@@ -330,7 +339,7 @@ def convert_time_str(timestamp):
     """This function converts time to string format."""
     timestamp_sec = float(timestamp) / 1000000
     local_timestamp = time.localtime(timestamp_sec)
-    ms = timestamp_sec - long(timestamp_sec)
+    ms = timestamp_sec - int(timestamp_sec)
     ms_str = "{0:06}".format(int(round(ms * 1000000)))
 
     str_format = time.strftime("%m_%d__%H_%M_%S", local_timestamp)
@@ -442,7 +451,9 @@ def parse_iso_packet(packet, flags):
     # Ignore timestamp, sequence number
     packet = unpack_data(packet, 6, True)
     iso_sdu_length, packet = unpack_data(packet, 2, False)
-    if iso_sdu_length != len(packet):
+    if len(packet) == 0:
+        debug_print("The iso data is empty")
+    elif iso_sdu_length != len(packet):
         debug_print("Invalid iso sdu length")
         return
 
@@ -497,17 +508,22 @@ def main():
         "--header",
         help="Add the header for LC3 Conformance Interoperability Test Software V.1.0.3.",
         action="store_true")
+    parser.add_argument("--ase_handle", help="Set the ASE handle manually.", type=int)
 
     argv = parser.parse_args()
     BTSNOOP_FILE_NAME = argv.btsnoop_file
 
     global debug_enable
     global add_header
+    global ase_handle
     if argv.verbose:
         debug_enable = True
 
     if argv.header:
         add_header = True
+
+    if argv.ase_handle:
+        ase_handle = int(argv.ase_handle)
 
     with open(BTSNOOP_FILE_NAME, "rb") as btsnoop_file:
         if btsnoop_file.read(16) != BTSNOOP_HEADER:

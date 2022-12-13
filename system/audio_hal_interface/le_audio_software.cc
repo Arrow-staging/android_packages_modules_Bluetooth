@@ -19,326 +19,69 @@
 
 #include "le_audio_software.h"
 
-#include "client_interface.h"
+#include <unordered_map>
+#include <vector>
+
+#include "aidl/le_audio_software_aidl.h"
+#include "bta/le_audio/codec_manager.h"
 #include "hal_version_manager.h"
+#include "hidl/le_audio_software_hidl.h"
 #include "osi/include/log.h"
 #include "osi/include/properties.h"
-
-namespace {
-
-using ::android::hardware::bluetooth::audio::V2_0::BitsPerSample;
-using ::android::hardware::bluetooth::audio::V2_0::ChannelMode;
-using ::android::hardware::bluetooth::audio::V2_0::CodecType;
-using ::android::hardware::bluetooth::audio::V2_1::PcmParameters;
-using ::bluetooth::audio::AudioConfiguration_2_2;
-using ::bluetooth::audio::BluetoothAudioCtrlAck;
-using ::bluetooth::audio::SampleRate_2_1;
-using ::bluetooth::audio::SessionType;
-using ::bluetooth::audio::SessionType_2_1;
-using ::bluetooth::audio::le_audio::LeAudioClientInterface;
-using ::bluetooth::audio::le_audio::StreamCallbacks;
-
-bluetooth::audio::BluetoothAudioSinkClientInterface*
-    le_audio_sink_hal_clientinterface = nullptr;
-bluetooth::audio::BluetoothAudioSourceClientInterface*
-    le_audio_source_hal_clientinterface = nullptr;
-
-static bool is_source_hal_enabled() {
-  return le_audio_source_hal_clientinterface != nullptr;
-}
-
-static bool is_sink_hal_enabled() {
-  return le_audio_sink_hal_clientinterface != nullptr;
-}
-
-class LeAudioTransport {
- public:
-  LeAudioTransport(void (*flush)(void), StreamCallbacks stream_cb,
-                   PcmParameters pcm_config)
-      : flush_(std::move(flush)),
-        stream_cb_(std::move(stream_cb)),
-        remote_delay_report_ms_(0),
-        total_bytes_processed_(0),
-        data_position_({}),
-        pcm_config_(std::move(pcm_config)),
-        is_pending_start_request_(false){};
-
-  BluetoothAudioCtrlAck StartRequest() {
-    LOG(INFO) << __func__;
-
-    /*
-     * Set successful state as initial, it may be overwritten with cancelation
-     * during on_resume handling
-     */
-    pending_start_request_state_ = BluetoothAudioCtrlAck::PENDING;
-
-    if (stream_cb_.on_resume_(true)) {
-      if (pending_start_request_state_ == BluetoothAudioCtrlAck::PENDING)
-        is_pending_start_request_ = true;
-
-      return pending_start_request_state_;
-    }
-
-    return BluetoothAudioCtrlAck::FAILURE;
-  }
-
-  BluetoothAudioCtrlAck SuspendRequest() {
-    LOG(INFO) << __func__;
-    if (stream_cb_.on_suspend_()) {
-      flush_();
-      return BluetoothAudioCtrlAck::SUCCESS_FINISHED;
-    } else {
-      return BluetoothAudioCtrlAck::FAILURE;
-    }
-  }
-
-  void StopRequest() {
-    LOG(INFO) << __func__;
-    if (stream_cb_.on_suspend_()) {
-      flush_();
-    }
-  }
-
-  bool GetPresentationPosition(uint64_t* remote_delay_report_ns,
-                               uint64_t* total_bytes_processed,
-                               timespec* data_position) {
-    VLOG(2) << __func__ << ": data=" << total_bytes_processed_
-            << " byte(s), timestamp=" << data_position_.tv_sec << "."
-            << data_position_.tv_nsec
-            << "s, delay report=" << remote_delay_report_ms_ << " msec.";
-    if (remote_delay_report_ns != nullptr) {
-      *remote_delay_report_ns = remote_delay_report_ms_ * 1000000u;
-    }
-    if (total_bytes_processed != nullptr)
-      *total_bytes_processed = total_bytes_processed_;
-    if (data_position != nullptr) *data_position = data_position_;
-
-    return true;
-  }
-
-  void MetadataChanged(const source_metadata_t& source_metadata) {
-    auto track_count = source_metadata.track_count;
-
-    if (track_count == 0) {
-      LOG(WARNING) << ", invalid number of metadata changed tracks";
-      return;
-    }
-
-    stream_cb_.on_metadata_update_(source_metadata);
-  }
-
-  void ResetPresentationPosition() {
-    VLOG(2) << __func__ << ": called.";
-    remote_delay_report_ms_ = 0;
-    total_bytes_processed_ = 0;
-    data_position_ = {};
-  }
-
-  void LogBytesProcessed(size_t bytes_processed) {
-    if (bytes_processed) {
-      total_bytes_processed_ += bytes_processed;
-      clock_gettime(CLOCK_MONOTONIC, &data_position_);
-    }
-  }
-
-  void SetRemoteDelay(uint16_t delay_report_ms) {
-    LOG(INFO) << __func__ << ": delay_report=" << delay_report_ms << " msec";
-    remote_delay_report_ms_ = delay_report_ms;
-  }
-
-  const PcmParameters& LeAudioGetSelectedHalPcmConfig() { return pcm_config_; }
-
-  void LeAudioSetSelectedHalPcmConfig(SampleRate_2_1 sample_rate,
-                                      BitsPerSample bit_rate,
-                                      ChannelMode channel_mode,
-                                      uint32_t data_interval) {
-    pcm_config_.sampleRate = sample_rate;
-    pcm_config_.bitsPerSample = bit_rate;
-    pcm_config_.channelMode = channel_mode;
-    pcm_config_.dataIntervalUs = data_interval;
-  }
-
-  bool SetAudioCtrlAckStateAndResetPendingStartStreamFlag(
-      BluetoothAudioCtrlAck state) {
-    bool ret = is_pending_start_request_;
-    is_pending_start_request_ = false;
-    pending_start_request_state_ = state;
-
-    return ret;
-  }
-
- private:
-  void (*flush_)(void);
-  StreamCallbacks stream_cb_;
-  uint16_t remote_delay_report_ms_;
-  uint64_t total_bytes_processed_;
-  timespec data_position_;
-  PcmParameters pcm_config_;
-  bool is_pending_start_request_;
-  BluetoothAudioCtrlAck pending_start_request_state_;
-};
-
-static void flush_sink() {
-  if (!is_sink_hal_enabled()) return;
-
-  le_audio_sink_hal_clientinterface->FlushAudioData();
-}
-
-// Sink transport implementation for Le Audio
-class LeAudioSinkTransport
-    : public bluetooth::audio::IBluetoothSinkTransportInstance {
- public:
-  LeAudioSinkTransport(StreamCallbacks stream_cb)
-      : IBluetoothSinkTransportInstance(
-            SessionType_2_1::LE_AUDIO_SOFTWARE_ENCODING_DATAPATH,
-            (AudioConfiguration_2_2){}) {
-    transport_ =
-        new LeAudioTransport(flush_sink, std::move(stream_cb),
-                             {SampleRate_2_1::RATE_16000, ChannelMode::STEREO,
-                              BitsPerSample::BITS_16, 0});
-  };
-
-  ~LeAudioSinkTransport() { delete transport_; }
-
-  BluetoothAudioCtrlAck StartRequest() override {
-    return transport_->StartRequest();
-  }
-
-  BluetoothAudioCtrlAck SuspendRequest() override {
-    return transport_->SuspendRequest();
-  }
-
-  void StopRequest() override { transport_->StopRequest(); }
-
-  bool GetPresentationPosition(uint64_t* remote_delay_report_ns,
-                               uint64_t* total_bytes_read,
-                               timespec* data_position) override {
-    return transport_->GetPresentationPosition(remote_delay_report_ns,
-                                               total_bytes_read, data_position);
-  }
-
-  void MetadataChanged(const source_metadata_t& source_metadata) override {
-    transport_->MetadataChanged(source_metadata);
-  }
-
-  void ResetPresentationPosition() override {
-    transport_->ResetPresentationPosition();
-  }
-
-  void LogBytesRead(size_t bytes_read) override {
-    transport_->LogBytesProcessed(bytes_read);
-  }
-
-  void SetRemoteDelay(uint16_t delay_report_ms) {
-    transport_->SetRemoteDelay(delay_report_ms);
-  }
-
-  const PcmParameters& LeAudioGetSelectedHalPcmConfig() {
-    return transport_->LeAudioGetSelectedHalPcmConfig();
-  }
-
-  void LeAudioSetSelectedHalPcmConfig(SampleRate_2_1 sample_rate,
-                                      BitsPerSample bit_rate,
-                                      ChannelMode channel_mode,
-                                      uint32_t data_interval) {
-    transport_->LeAudioSetSelectedHalPcmConfig(sample_rate, bit_rate,
-                                               channel_mode, data_interval);
-  }
-
-  bool SetAudioCtrlAckStateAndResetPendingStartStreamFlag(
-      BluetoothAudioCtrlAck state = BluetoothAudioCtrlAck::PENDING) {
-    return transport_->SetAudioCtrlAckStateAndResetPendingStartStreamFlag(
-        state);
-  }
-
- private:
-  LeAudioTransport* transport_;
-};
-
-static void flush_source() {
-  if (le_audio_source_hal_clientinterface == nullptr) return;
-
-  le_audio_source_hal_clientinterface->FlushAudioData();
-}
-
-class LeAudioSourceTransport
-    : public bluetooth::audio::IBluetoothSourceTransportInstance {
- public:
-  LeAudioSourceTransport(StreamCallbacks stream_cb)
-      : IBluetoothSourceTransportInstance(
-            SessionType_2_1::LE_AUDIO_SOFTWARE_DECODED_DATAPATH,
-            (AudioConfiguration_2_2){}) {
-    transport_ =
-        new LeAudioTransport(flush_source, std::move(stream_cb),
-                             {SampleRate_2_1::RATE_16000, ChannelMode::MONO,
-                              BitsPerSample::BITS_16, 0});
-  };
-
-  ~LeAudioSourceTransport() { delete transport_; }
-
-  BluetoothAudioCtrlAck StartRequest() override {
-    return transport_->StartRequest();
-  }
-
-  BluetoothAudioCtrlAck SuspendRequest() override {
-    return transport_->SuspendRequest();
-  }
-
-  void StopRequest() override { transport_->StopRequest(); }
-
-  bool GetPresentationPosition(uint64_t* remote_delay_report_ns,
-                               uint64_t* total_bytes_written,
-                               timespec* data_position) override {
-    return transport_->GetPresentationPosition(
-        remote_delay_report_ns, total_bytes_written, data_position);
-  }
-
-  void MetadataChanged(const source_metadata_t& source_metadata) override {
-    transport_->MetadataChanged(source_metadata);
-  }
-
-  void ResetPresentationPosition() override {
-    transport_->ResetPresentationPosition();
-  }
-
-  void LogBytesWritten(size_t bytes_written) override {
-    transport_->LogBytesProcessed(bytes_written);
-  }
-
-  void SetRemoteDelay(uint16_t delay_report_ms) {
-    transport_->SetRemoteDelay(delay_report_ms);
-  }
-
-  const PcmParameters& LeAudioGetSelectedHalPcmConfig() {
-    return transport_->LeAudioGetSelectedHalPcmConfig();
-  }
-
-  void LeAudioSetSelectedHalPcmConfig(SampleRate_2_1 sample_rate,
-                                      BitsPerSample bit_rate,
-                                      ChannelMode channel_mode,
-                                      uint32_t data_interval) {
-    transport_->LeAudioSetSelectedHalPcmConfig(sample_rate, bit_rate,
-                                               channel_mode, data_interval);
-  }
-
-  bool SetAudioCtrlAckStateAndResetPendingStartStreamFlag(
-      BluetoothAudioCtrlAck state = BluetoothAudioCtrlAck::PENDING) {
-    return transport_->SetAudioCtrlAckStateAndResetPendingStartStreamFlag(
-        state);
-  }
-
- private:
-  LeAudioTransport* transport_;
-};
-
-// Instance of Le Audio to provide call-in APIs for Bluetooth Audio Hal
-LeAudioSinkTransport* le_audio_sink = nullptr;
-LeAudioSourceTransport* le_audio_source = nullptr;
-}  // namespace
 
 namespace bluetooth {
 namespace audio {
 namespace le_audio {
+
+namespace {
+
+using ::android::hardware::bluetooth::audio::V2_1::PcmParameters;
+using AudioConfiguration_2_1 =
+    ::android::hardware::bluetooth::audio::V2_1::AudioConfiguration;
+using AudioConfigurationAIDL =
+    ::aidl::android::hardware::bluetooth::audio::AudioConfiguration;
+using ::aidl::android::hardware::bluetooth::audio::LeAudioCodecConfiguration;
+
+using ::le_audio::CodecManager;
+using ::le_audio::set_configurations::AudioSetConfiguration;
+using ::le_audio::types::CodecLocation;
+}  // namespace
+
+std::vector<AudioSetConfiguration> get_offload_capabilities() {
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    return std::vector<AudioSetConfiguration>(0);
+  }
+  return aidl::le_audio::get_offload_capabilities();
+}
+
+aidl::BluetoothAudioSinkClientInterface* get_aidl_client_interface(
+    bool is_broadcaster) {
+  if (is_broadcaster)
+    return aidl::le_audio::LeAudioSinkTransport::interface_broadcast_;
+
+  return aidl::le_audio::LeAudioSinkTransport::interface_unicast_;
+}
+
+aidl::le_audio::LeAudioSinkTransport* get_aidl_transport_instance(
+    bool is_broadcaster) {
+  if (is_broadcaster)
+    return aidl::le_audio::LeAudioSinkTransport::instance_broadcast_;
+
+  return aidl::le_audio::LeAudioSinkTransport::instance_unicast_;
+}
+
+bool is_aidl_offload_encoding_session(bool is_broadcaster) {
+  return get_aidl_client_interface(is_broadcaster)
+                 ->GetTransportInstance()
+                 ->GetSessionType() ==
+             aidl::SessionType::LE_AUDIO_HARDWARE_OFFLOAD_ENCODING_DATAPATH ||
+         get_aidl_client_interface(is_broadcaster)
+                 ->GetTransportInstance()
+                 ->GetSessionType() ==
+             aidl::SessionType::
+                 LE_AUDIO_BROADCAST_HARDWARE_OFFLOAD_ENCODING_DATAPATH;
+}
 
 LeAudioClientInterface* LeAudioClientInterface::interface = nullptr;
 LeAudioClientInterface* LeAudioClientInterface::Get() {
@@ -353,76 +96,60 @@ LeAudioClientInterface* LeAudioClientInterface::Get() {
   return LeAudioClientInterface::interface;
 }
 
-static SampleRate_2_1 le_audio_sample_rate2audio_hal(uint32_t sample_rate_2_1) {
-  switch (sample_rate_2_1) {
-    case 8000:
-      return SampleRate_2_1::RATE_8000;
-    case 16000:
-      return SampleRate_2_1::RATE_16000;
-    case 24000:
-      return SampleRate_2_1::RATE_24000;
-    case 32000:
-      return SampleRate_2_1::RATE_32000;
-    case 44100:
-      return SampleRate_2_1::RATE_44100;
-    case 48000:
-      return SampleRate_2_1::RATE_48000;
-    case 88200:
-      return SampleRate_2_1::RATE_88200;
-    case 96000:
-      return SampleRate_2_1::RATE_96000;
-    case 176400:
-      return SampleRate_2_1::RATE_176400;
-    case 192000:
-      return SampleRate_2_1::RATE_192000;
-  };
-  return SampleRate_2_1::RATE_UNKNOWN;
-}
-
-static BitsPerSample le_audio_bit_rate2audio_hal(uint8_t bits_per_sample) {
-  switch (bits_per_sample) {
-    case 16:
-      return BitsPerSample::BITS_16;
-    case 24:
-      return BitsPerSample::BITS_24;
-    case 32:
-      return BitsPerSample::BITS_32;
-  };
-  return BitsPerSample::BITS_UNKNOWN;
-}
-
-static ChannelMode le_audio_channel_mode2audio_hal(uint8_t channels_count) {
-  switch (channels_count) {
-    case 1:
-      return ChannelMode::MONO;
-    case 2:
-      return ChannelMode::STEREO;
-  }
-  return ChannelMode::UNKNOWN;
-}
-
 void LeAudioClientInterface::Sink::Cleanup() {
   LOG(INFO) << __func__ << " sink";
   StopSession();
-  delete le_audio_sink_hal_clientinterface;
-  le_audio_sink_hal_clientinterface = nullptr;
-  delete le_audio_sink;
-  le_audio_sink = nullptr;
+  if (hidl::le_audio::LeAudioSinkTransport::interface) {
+    delete hidl::le_audio::LeAudioSinkTransport::interface;
+    hidl::le_audio::LeAudioSinkTransport::interface = nullptr;
+  }
+  if (hidl::le_audio::LeAudioSinkTransport::instance) {
+    delete hidl::le_audio::LeAudioSinkTransport::instance;
+    hidl::le_audio::LeAudioSinkTransport::instance = nullptr;
+  }
+  if (aidl::le_audio::LeAudioSinkTransport::interface_unicast_) {
+    delete aidl::le_audio::LeAudioSinkTransport::interface_unicast_;
+    aidl::le_audio::LeAudioSinkTransport::interface_unicast_ = nullptr;
+  }
+  if (aidl::le_audio::LeAudioSinkTransport::interface_broadcast_) {
+    delete aidl::le_audio::LeAudioSinkTransport::interface_broadcast_;
+    aidl::le_audio::LeAudioSinkTransport::interface_broadcast_ = nullptr;
+  }
+  if (aidl::le_audio::LeAudioSinkTransport::instance_unicast_) {
+    delete aidl::le_audio::LeAudioSinkTransport::instance_unicast_;
+    aidl::le_audio::LeAudioSinkTransport::instance_unicast_ = nullptr;
+  }
+  if (aidl::le_audio::LeAudioSinkTransport::instance_broadcast_) {
+    delete aidl::le_audio::LeAudioSinkTransport::instance_broadcast_;
+    aidl::le_audio::LeAudioSinkTransport::instance_broadcast_ = nullptr;
+  }
 }
 
 void LeAudioClientInterface::Sink::SetPcmParameters(
     const PcmParameters& params) {
-  le_audio_sink->LeAudioSetSelectedHalPcmConfig(
-      le_audio_sample_rate2audio_hal(params.sample_rate),
-      le_audio_bit_rate2audio_hal(params.bits_per_sample),
-      le_audio_channel_mode2audio_hal(params.channels_count),
-      params.data_interval_us);
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    return hidl::le_audio::LeAudioSinkTransport::instance
+        ->LeAudioSetSelectedHalPcmConfig(
+            params.sample_rate, params.bits_per_sample, params.channels_count,
+            params.data_interval_us);
+  }
+  return get_aidl_transport_instance(is_broadcaster_)
+      ->LeAudioSetSelectedHalPcmConfig(
+          params.sample_rate, params.bits_per_sample, params.channels_count,
+          params.data_interval_us);
 }
 
 // Update Le Audio delay report to BluetoothAudio HAL
 void LeAudioClientInterface::Sink::SetRemoteDelay(uint16_t delay_report_ms) {
   LOG(INFO) << __func__ << ": delay_report_ms=" << delay_report_ms << " ms";
-  le_audio_sink->SetRemoteDelay(delay_report_ms);
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    hidl::le_audio::LeAudioSinkTransport::instance->SetRemoteDelay(
+        delay_report_ms);
+    return;
+  }
+  get_aidl_transport_instance(is_broadcaster_)->SetRemoteDelay(delay_report_ms);
 }
 
 void LeAudioClientInterface::Sink::StartSession() {
@@ -430,132 +157,481 @@ void LeAudioClientInterface::Sink::StartSession() {
   if (HalVersionManager::GetHalVersion() ==
       BluetoothAudioHalVersion::VERSION_2_1) {
     AudioConfiguration_2_1 audio_config;
-    audio_config.pcmConfig(le_audio_sink->LeAudioGetSelectedHalPcmConfig());
-    if (!le_audio_sink_hal_clientinterface->UpdateAudioConfig_2_1(
+    audio_config.pcmConfig(hidl::le_audio::LeAudioSinkTransport::instance
+                               ->LeAudioGetSelectedHalPcmConfig());
+    if (!hidl::le_audio::LeAudioSinkTransport::interface->UpdateAudioConfig_2_1(
             audio_config)) {
       LOG(ERROR) << __func__ << ": cannot update audio config to HAL";
       return;
     }
-    le_audio_sink_hal_clientinterface->StartSession_2_1();
+    hidl::le_audio::LeAudioSinkTransport::interface->StartSession_2_1();
     return;
+  } else if (HalVersionManager::GetHalVersion() ==
+             BluetoothAudioHalVersion::VERSION_AIDL_V1) {
+    AudioConfigurationAIDL audio_config;
+    if (is_aidl_offload_encoding_session(is_broadcaster_)) {
+      if (is_broadcaster_) {
+        audio_config.set<AudioConfigurationAIDL::leAudioBroadcastConfig>(
+            get_aidl_transport_instance(is_broadcaster_)
+                ->LeAudioGetBroadcastConfig());
+      } else {
+        aidl::le_audio::LeAudioConfiguration le_audio_config = {};
+        audio_config.set<AudioConfigurationAIDL::leAudioConfig>(
+            le_audio_config);
+      }
+    } else {
+      audio_config.set<AudioConfigurationAIDL::pcmConfig>(
+          get_aidl_transport_instance(is_broadcaster_)
+              ->LeAudioGetSelectedHalPcmConfig());
+    }
+    if (!get_aidl_client_interface(is_broadcaster_)
+             ->UpdateAudioConfig(audio_config)) {
+      LOG(ERROR) << __func__ << ": cannot update audio config to HAL";
+      return;
+    }
+    get_aidl_client_interface(is_broadcaster_)->StartSession();
   }
-  AudioConfiguration_2_2 audio_config;
-  audio_config.pcmConfig(le_audio_sink->LeAudioGetSelectedHalPcmConfig());
-  if (!le_audio_sink_hal_clientinterface->UpdateAudioConfig_2_2(audio_config)) {
-    LOG(ERROR) << __func__ << ": cannot update audio config to HAL";
-    return;
-  }
-  le_audio_sink_hal_clientinterface->StartSession_2_2();
 }
 
 void LeAudioClientInterface::Sink::ConfirmStreamingRequest() {
-  LOG(INFO) << __func__;
-  if (!le_audio_sink->SetAudioCtrlAckStateAndResetPendingStartStreamFlag()) {
-    LOG(WARNING) << ", no pending start stream request";
-    return;
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    auto hidl_instance = hidl::le_audio::LeAudioSinkTransport::instance;
+    auto start_request_state = hidl_instance->GetStartRequestState();
+
+    switch (start_request_state) {
+      case StartRequestState::IDLE:
+        LOG_WARN(", no pending start stream request");
+        return;
+      case StartRequestState::PENDING_BEFORE_RESUME:
+        LOG_INFO("Response before sending PENDING to audio HAL");
+        hidl_instance->SetStartRequestState(StartRequestState::CONFIRMED);
+        return;
+      case StartRequestState::PENDING_AFTER_RESUME:
+        LOG_INFO("Response after sending PENDING to audio HAL");
+        hidl_instance->ClearStartRequestState();
+        hidl::le_audio::LeAudioSinkTransport::interface->StreamStarted(
+            hidl::BluetoothAudioCtrlAck::SUCCESS_FINISHED);
+        return;
+      case StartRequestState::CONFIRMED:
+      case StartRequestState::CANCELED:
+        LOG_ERROR("Invalid state, start stream already confirmed");
+        return;
+    }
   }
 
-  le_audio_sink_hal_clientinterface->StreamStarted(
-      BluetoothAudioCtrlAck::SUCCESS_FINISHED);
+  auto aidl_instance = get_aidl_transport_instance(is_broadcaster_);
+  auto start_request_state = aidl_instance->GetStartRequestState();
+  switch (start_request_state) {
+    case StartRequestState::IDLE:
+      LOG_WARN(", no pending start stream request");
+      return;
+    case StartRequestState::PENDING_BEFORE_RESUME:
+      LOG_INFO("Response before sending PENDING to audio HAL");
+      aidl_instance->SetStartRequestState(StartRequestState::CONFIRMED);
+      return;
+    case StartRequestState::PENDING_AFTER_RESUME:
+      LOG_INFO("Response after sending PENDING to audio HAL");
+      aidl_instance->ClearStartRequestState();
+      get_aidl_client_interface(is_broadcaster_)
+          ->StreamStarted(aidl::BluetoothAudioCtrlAck::SUCCESS_FINISHED);
+      return;
+    case StartRequestState::CONFIRMED:
+    case StartRequestState::CANCELED:
+      LOG_ERROR("Invalid state, start stream already confirmed");
+      return;
+  }
 }
 
 void LeAudioClientInterface::Sink::CancelStreamingRequest() {
-  LOG(INFO) << __func__;
-  if (!le_audio_sink->SetAudioCtrlAckStateAndResetPendingStartStreamFlag(
-          BluetoothAudioCtrlAck::FAILURE)) {
-    LOG(WARNING) << ", no pending start stream request";
-    return;
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    auto hidl_instance = hidl::le_audio::LeAudioSinkTransport::instance;
+    auto start_request_state = hidl_instance->GetStartRequestState();
+    switch (start_request_state) {
+      case StartRequestState::IDLE:
+        LOG_WARN(", no pending start stream request");
+        return;
+      case StartRequestState::PENDING_BEFORE_RESUME:
+        LOG_INFO("Response before sending PENDING to audio HAL");
+        hidl_instance->SetStartRequestState(StartRequestState::CANCELED);
+        return;
+      case StartRequestState::PENDING_AFTER_RESUME:
+        LOG_INFO("Response after sending PENDING to audio HAL");
+        hidl_instance->ClearStartRequestState();
+        hidl::le_audio::LeAudioSinkTransport::interface->StreamStarted(
+            hidl::BluetoothAudioCtrlAck::FAILURE);
+        return;
+      case StartRequestState::CONFIRMED:
+      case StartRequestState::CANCELED:
+        LOG_ERROR("Invalid state, start stream already confirmed");
+        break;
+    }
   }
 
-  le_audio_sink_hal_clientinterface->StreamStarted(
-      BluetoothAudioCtrlAck::FAILURE);
+  auto aidl_instance = get_aidl_transport_instance(is_broadcaster_);
+  auto start_request_state = aidl_instance->GetStartRequestState();
+  switch (start_request_state) {
+    case StartRequestState::IDLE:
+      LOG_WARN(", no pending start stream request");
+      return;
+    case StartRequestState::PENDING_BEFORE_RESUME:
+      LOG_INFO("Response before sending PENDING to audio HAL");
+      aidl_instance->SetStartRequestState(StartRequestState::CANCELED);
+      return;
+    case StartRequestState::PENDING_AFTER_RESUME:
+      LOG_INFO("Response after sending PENDING to audio HAL");
+      aidl_instance->ClearStartRequestState();
+      get_aidl_client_interface(is_broadcaster_)
+          ->StreamStarted(aidl::BluetoothAudioCtrlAck::FAILURE);
+      return;
+    case StartRequestState::CONFIRMED:
+    case StartRequestState::CANCELED:
+      LOG_ERROR("Invalid state, start stream already confirmed");
+      break;
+  }
 }
 
 void LeAudioClientInterface::Sink::StopSession() {
   LOG(INFO) << __func__ << " sink";
-  le_audio_sink->SetAudioCtrlAckStateAndResetPendingStartStreamFlag();
-  le_audio_sink_hal_clientinterface->EndSession();
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    hidl::le_audio::LeAudioSinkTransport::instance->ClearStartRequestState();
+    hidl::le_audio::LeAudioSinkTransport::interface->EndSession();
+    return;
+  }
+  get_aidl_transport_instance(is_broadcaster_)->ClearStartRequestState();
+  get_aidl_client_interface(is_broadcaster_)->EndSession();
+}
+
+void LeAudioClientInterface::Sink::UpdateAudioConfigToHal(
+    const ::le_audio::offload_config& offload_config) {
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    return;
+  }
+
+  if (is_broadcaster_ || !is_aidl_offload_encoding_session(is_broadcaster_)) {
+    return;
+  }
+
+  get_aidl_client_interface(is_broadcaster_)
+      ->UpdateAudioConfig(
+          aidl::le_audio::offload_config_to_hal_audio_config(offload_config));
+}
+
+void LeAudioClientInterface::Sink::UpdateBroadcastAudioConfigToHal(
+    const ::le_audio::broadcast_offload_config& offload_config) {
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    return;
+  }
+
+  if (!is_broadcaster_ || !is_aidl_offload_encoding_session(is_broadcaster_)) {
+    return;
+  }
+
+  get_aidl_transport_instance(is_broadcaster_)
+      ->LeAudioSetBroadcastConfig(offload_config);
+}
+
+void LeAudioClientInterface::Sink::SuspendedForReconfiguration() {
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    hidl::le_audio::LeAudioSinkTransport::interface->StreamSuspended(
+        hidl::BluetoothAudioCtrlAck::SUCCESS_FINISHED);
+    return;
+  }
+
+  get_aidl_client_interface(is_broadcaster_)
+      ->StreamSuspended(aidl::BluetoothAudioCtrlAck::SUCCESS_RECONFIGURATION);
+}
+
+void LeAudioClientInterface::Sink::ReconfigurationComplete() {
+  // This is needed only for AIDL since SuspendedForReconfiguration()
+  // already calls StreamSuspended(SUCCESS_FINISHED) for HIDL
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::AIDL) {
+    // FIXME: For now we have to workaround the missing API and use
+    //        StreamSuspended() with SUCCESS_FINISHED ack code.
+    get_aidl_client_interface(is_broadcaster_)
+        ->StreamSuspended(aidl::BluetoothAudioCtrlAck::SUCCESS_FINISHED);
+  }
 }
 
 size_t LeAudioClientInterface::Sink::Read(uint8_t* p_buf, uint32_t len) {
-  return le_audio_sink_hal_clientinterface->ReadAudioData(p_buf, len);
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    return hidl::le_audio::LeAudioSinkTransport::interface->ReadAudioData(p_buf,
+                                                                          len);
+  }
+  return get_aidl_client_interface(is_broadcaster_)->ReadAudioData(p_buf, len);
 }
 
 void LeAudioClientInterface::Source::Cleanup() {
   LOG(INFO) << __func__ << " source";
   StopSession();
-  delete le_audio_source_hal_clientinterface;
-  le_audio_source_hal_clientinterface = nullptr;
-  delete le_audio_source;
-  le_audio_source = nullptr;
+  if (hidl::le_audio::LeAudioSourceTransport::interface) {
+    delete hidl::le_audio::LeAudioSourceTransport::interface;
+    hidl::le_audio::LeAudioSourceTransport::interface = nullptr;
+  }
+  if (hidl::le_audio::LeAudioSourceTransport::instance) {
+    delete hidl::le_audio::LeAudioSourceTransport::instance;
+    hidl::le_audio::LeAudioSourceTransport::instance = nullptr;
+  }
+  if (aidl::le_audio::LeAudioSourceTransport::interface) {
+    delete aidl::le_audio::LeAudioSourceTransport::interface;
+    aidl::le_audio::LeAudioSourceTransport::interface = nullptr;
+  }
+  if (aidl::le_audio::LeAudioSourceTransport::instance) {
+    delete aidl::le_audio::LeAudioSourceTransport::instance;
+    aidl::le_audio::LeAudioSourceTransport::instance = nullptr;
+  }
 }
 
 void LeAudioClientInterface::Source::SetPcmParameters(
     const PcmParameters& params) {
-  le_audio_source->LeAudioSetSelectedHalPcmConfig(
-      le_audio_sample_rate2audio_hal(params.sample_rate),
-      le_audio_bit_rate2audio_hal(params.bits_per_sample),
-      le_audio_channel_mode2audio_hal(params.channels_count),
-      params.data_interval_us);
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    hidl::le_audio::LeAudioSourceTransport::instance
+        ->LeAudioSetSelectedHalPcmConfig(
+            params.sample_rate, params.bits_per_sample, params.channels_count,
+            params.data_interval_us);
+    return;
+  }
+  return aidl::le_audio::LeAudioSourceTransport::instance
+      ->LeAudioSetSelectedHalPcmConfig(
+          params.sample_rate, params.bits_per_sample, params.channels_count,
+          params.data_interval_us);
 }
 
 void LeAudioClientInterface::Source::SetRemoteDelay(uint16_t delay_report_ms) {
   LOG(INFO) << __func__ << ": delay_report_ms=" << delay_report_ms << " ms";
-  le_audio_source->SetRemoteDelay(delay_report_ms);
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    hidl::le_audio::LeAudioSourceTransport::instance->SetRemoteDelay(
+        delay_report_ms);
+    return;
+  }
+  return aidl::le_audio::LeAudioSourceTransport::instance->SetRemoteDelay(
+      delay_report_ms);
 }
 
 void LeAudioClientInterface::Source::StartSession() {
   LOG(INFO) << __func__;
-  if (!is_source_hal_enabled()) return;
-  AudioConfiguration_2_2 audio_config;
-  audio_config.pcmConfig(le_audio_source->LeAudioGetSelectedHalPcmConfig());
-  if (!le_audio_source_hal_clientinterface->UpdateAudioConfig_2_2(
-          audio_config)) {
-    LOG(ERROR) << __func__ << ": cannot update audio config to HAL";
+  if (HalVersionManager::GetHalVersion() ==
+      BluetoothAudioHalVersion::VERSION_2_1) {
+    AudioConfiguration_2_1 audio_config;
+    audio_config.pcmConfig(hidl::le_audio::LeAudioSourceTransport::instance
+                               ->LeAudioGetSelectedHalPcmConfig());
+    if (!hidl::le_audio::LeAudioSourceTransport::
+             interface->UpdateAudioConfig_2_1(audio_config)) {
+      LOG(ERROR) << __func__ << ": cannot update audio config to HAL";
+      return;
+    }
+    hidl::le_audio::LeAudioSourceTransport::interface->StartSession_2_1();
+    return;
+  } else if (HalVersionManager::GetHalVersion() ==
+             BluetoothAudioHalVersion::VERSION_AIDL_V1) {
+    AudioConfigurationAIDL audio_config;
+    if (aidl::le_audio::LeAudioSourceTransport::
+            interface->GetTransportInstance()
+                ->GetSessionType() ==
+        aidl::SessionType::LE_AUDIO_HARDWARE_OFFLOAD_DECODING_DATAPATH) {
+      aidl::le_audio::LeAudioConfiguration le_audio_config;
+      audio_config.set<AudioConfigurationAIDL::leAudioConfig>(
+          aidl::le_audio::LeAudioConfiguration{});
+    } else {
+      audio_config.set<AudioConfigurationAIDL::pcmConfig>(
+          aidl::le_audio::LeAudioSourceTransport::instance
+              ->LeAudioGetSelectedHalPcmConfig());
+    }
+
+    if (!aidl::le_audio::LeAudioSourceTransport::interface->UpdateAudioConfig(
+            audio_config)) {
+      LOG(ERROR) << __func__ << ": cannot update audio config to HAL";
+      return;
+    }
+    aidl::le_audio::LeAudioSourceTransport::interface->StartSession();
+  }
+}
+
+void LeAudioClientInterface::Source::SuspendedForReconfiguration() {
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    hidl::le_audio::LeAudioSourceTransport::interface->StreamSuspended(
+        hidl::BluetoothAudioCtrlAck::SUCCESS_FINISHED);
     return;
   }
-  le_audio_source_hal_clientinterface->StartSession_2_2();
+
+  aidl::le_audio::LeAudioSourceTransport::interface->StreamSuspended(
+      aidl::BluetoothAudioCtrlAck::SUCCESS_RECONFIGURATION);
+}
+
+void LeAudioClientInterface::Source::ReconfigurationComplete() {
+  // This is needed only for AIDL since SuspendedForReconfiguration()
+  // already calls StreamSuspended(SUCCESS_FINISHED) for HIDL
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::AIDL) {
+    // FIXME: For now we have to workaround the missing API and use
+    //        StreamSuspended() with SUCCESS_FINISHED ack code.
+    aidl::le_audio::LeAudioSourceTransport::interface->StreamSuspended(
+        aidl::BluetoothAudioCtrlAck::SUCCESS_FINISHED);
+  }
 }
 
 void LeAudioClientInterface::Source::ConfirmStreamingRequest() {
-  LOG(INFO) << __func__;
-  if (!le_audio_source->SetAudioCtrlAckStateAndResetPendingStartStreamFlag()) {
-    LOG(WARNING) << ", no pending start stream request";
-    return;
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    auto hidl_instance = hidl::le_audio::LeAudioSourceTransport::instance;
+    auto start_request_state = hidl_instance->GetStartRequestState();
+
+    switch (start_request_state) {
+      case StartRequestState::IDLE:
+        LOG_WARN(", no pending start stream request");
+        return;
+      case StartRequestState::PENDING_BEFORE_RESUME:
+        LOG_INFO("Response before sending PENDING to audio HAL");
+        hidl_instance->SetStartRequestState(StartRequestState::CONFIRMED);
+        return;
+      case StartRequestState::PENDING_AFTER_RESUME:
+        LOG_INFO("Response after sending PENDING to audio HAL");
+        hidl_instance->ClearStartRequestState();
+        hidl::le_audio::LeAudioSourceTransport::interface->StreamStarted(
+            hidl::BluetoothAudioCtrlAck::SUCCESS_FINISHED);
+        return;
+      case StartRequestState::CONFIRMED:
+      case StartRequestState::CANCELED:
+        LOG_ERROR("Invalid state, start stream already confirmed");
+        return;
+    }
   }
 
-  le_audio_source_hal_clientinterface->StreamStarted(
-      BluetoothAudioCtrlAck::SUCCESS_FINISHED);
+  auto aidl_instance = aidl::le_audio::LeAudioSourceTransport::instance;
+  auto start_request_state = aidl_instance->GetStartRequestState();
+  switch (start_request_state) {
+    case StartRequestState::IDLE:
+      LOG_WARN(", no pending start stream request");
+      return;
+    case StartRequestState::PENDING_BEFORE_RESUME:
+      LOG_INFO("Response before sending PENDING to audio HAL");
+      aidl_instance->SetStartRequestState(StartRequestState::CONFIRMED);
+      return;
+    case StartRequestState::PENDING_AFTER_RESUME:
+      LOG_INFO("Response after sending PENDING to audio HAL");
+      aidl_instance->ClearStartRequestState();
+      aidl::le_audio::LeAudioSourceTransport::interface->StreamStarted(
+          aidl::BluetoothAudioCtrlAck::SUCCESS_FINISHED);
+      return;
+    case StartRequestState::CONFIRMED:
+    case StartRequestState::CANCELED:
+      LOG_ERROR("Invalid state, start stream already confirmed");
+      return;
+  }
 }
 
 void LeAudioClientInterface::Source::CancelStreamingRequest() {
-  LOG(INFO) << __func__;
-  if (!le_audio_source->SetAudioCtrlAckStateAndResetPendingStartStreamFlag(
-          BluetoothAudioCtrlAck::FAILURE)) {
-    LOG(WARNING) << ", no pending start stream request";
-    return;
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    auto hidl_instance = hidl::le_audio::LeAudioSourceTransport::instance;
+    auto start_request_state = hidl_instance->GetStartRequestState();
+    switch (start_request_state) {
+      case StartRequestState::IDLE:
+        LOG_WARN(", no pending start stream request");
+        return;
+      case StartRequestState::PENDING_BEFORE_RESUME:
+        LOG_INFO("Response before sending PENDING to audio HAL");
+        hidl_instance->SetStartRequestState(StartRequestState::CANCELED);
+        return;
+      case StartRequestState::PENDING_AFTER_RESUME:
+        LOG_INFO("Response after sending PENDING to audio HAL");
+        hidl_instance->ClearStartRequestState();
+        hidl::le_audio::LeAudioSourceTransport::interface->StreamStarted(
+            hidl::BluetoothAudioCtrlAck::FAILURE);
+        return;
+      case StartRequestState::CONFIRMED:
+      case StartRequestState::CANCELED:
+        LOG_ERROR("Invalid state, start stream already confirmed");
+        break;
+    }
   }
 
-  le_audio_source_hal_clientinterface->StreamStarted(
-      BluetoothAudioCtrlAck::FAILURE);
+  auto aidl_instance = aidl::le_audio::LeAudioSourceTransport::instance;
+  auto start_request_state = aidl_instance->GetStartRequestState();
+  switch (start_request_state) {
+    case StartRequestState::IDLE:
+      LOG_WARN(", no pending start stream request");
+      return;
+    case StartRequestState::PENDING_BEFORE_RESUME:
+      LOG_INFO("Response before sending PENDING to audio HAL");
+      aidl_instance->SetStartRequestState(StartRequestState::CANCELED);
+      return;
+    case StartRequestState::PENDING_AFTER_RESUME:
+      LOG_INFO("Response after sending PENDING to audio HAL");
+      aidl_instance->ClearStartRequestState();
+      aidl::le_audio::LeAudioSourceTransport::interface->StreamStarted(
+          aidl::BluetoothAudioCtrlAck::FAILURE);
+      return;
+    case StartRequestState::CONFIRMED:
+    case StartRequestState::CANCELED:
+      LOG_ERROR("Invalid state, start stream already confirmed");
+      break;
+  }
 }
 
 void LeAudioClientInterface::Source::StopSession() {
   LOG(INFO) << __func__ << " source";
-  le_audio_source->SetAudioCtrlAckStateAndResetPendingStartStreamFlag();
-  le_audio_source_hal_clientinterface->EndSession();
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    hidl::le_audio::LeAudioSourceTransport::instance->ClearStartRequestState();
+    hidl::le_audio::LeAudioSourceTransport::interface->EndSession();
+    return;
+  }
+  aidl::le_audio::LeAudioSourceTransport::instance->ClearStartRequestState();
+  aidl::le_audio::LeAudioSourceTransport::interface->EndSession();
+}
+
+void LeAudioClientInterface::Source::UpdateAudioConfigToHal(
+    const ::le_audio::offload_config& offload_config) {
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    return;
+  }
+
+  if (aidl::le_audio::LeAudioSourceTransport::interface->GetTransportInstance()
+          ->GetSessionType() !=
+      aidl::SessionType::LE_AUDIO_HARDWARE_OFFLOAD_DECODING_DATAPATH) {
+    return;
+  }
+  aidl::le_audio::LeAudioSourceTransport::interface->UpdateAudioConfig(
+      aidl::le_audio::offload_config_to_hal_audio_config(offload_config));
 }
 
 size_t LeAudioClientInterface::Source::Write(const uint8_t* p_buf,
                                              uint32_t len) {
-  return le_audio_source_hal_clientinterface->WriteAudioData(p_buf, len);
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    return hidl::le_audio::LeAudioSourceTransport::interface->WriteAudioData(
+        p_buf, len);
+  }
+  return aidl::le_audio::LeAudioSourceTransport::interface->WriteAudioData(
+      p_buf, len);
 }
 
 LeAudioClientInterface::Sink* LeAudioClientInterface::GetSink(
     StreamCallbacks stream_cb,
-    bluetooth::common::MessageLoopThread* message_loop) {
-  if (sink_ == nullptr) {
-    sink_ = new Sink();
+    bluetooth::common::MessageLoopThread* message_loop,
+    bool is_broadcasting_session_type) {
+  if (is_broadcasting_session_type && HalVersionManager::GetHalTransport() ==
+                                          BluetoothAudioHalTransport::HIDL) {
+    LOG(WARNING) << __func__
+                 << ", No support for broadcasting Le Audio on HIDL";
+    return nullptr;
+  }
+
+  Sink* sink = is_broadcasting_session_type ? broadcast_sink_ : unicast_sink_;
+  if (sink == nullptr) {
+    sink = new Sink(is_broadcasting_session_type);
   } else {
     LOG(WARNING) << __func__ << ", Sink is already acquired";
     return nullptr;
@@ -563,38 +639,122 @@ LeAudioClientInterface::Sink* LeAudioClientInterface::GetSink(
 
   LOG(INFO) << __func__;
 
-  le_audio_sink = new LeAudioSinkTransport(std::move(stream_cb));
-  le_audio_sink_hal_clientinterface =
-      new bluetooth::audio::BluetoothAudioSinkClientInterface(le_audio_sink,
-                                                              message_loop);
-  if (!le_audio_sink_hal_clientinterface->IsValid()) {
-    LOG(WARNING) << __func__
-                 << ": BluetoothAudio HAL for Le Audio is invalid?!";
-    delete le_audio_sink_hal_clientinterface;
-    le_audio_sink_hal_clientinterface = nullptr;
-    delete le_audio_sink;
-    le_audio_sink = nullptr;
-    delete sink_;
-    sink_ = nullptr;
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    hidl::SessionType_2_1 session_type =
+        hidl::SessionType_2_1::LE_AUDIO_SOFTWARE_ENCODING_DATAPATH;
 
-    return nullptr;
+    hidl::le_audio::LeAudioSinkTransport::instance =
+        new hidl::le_audio::LeAudioSinkTransport(session_type,
+                                                 std::move(stream_cb));
+    hidl::le_audio::LeAudioSinkTransport::interface =
+        new hidl::BluetoothAudioSinkClientInterface(
+            hidl::le_audio::LeAudioSinkTransport::instance, message_loop);
+    if (!hidl::le_audio::LeAudioSinkTransport::interface->IsValid()) {
+      LOG(WARNING) << __func__
+                   << ": BluetoothAudio HAL for Le Audio is invalid?!";
+      delete hidl::le_audio::LeAudioSinkTransport::interface;
+      hidl::le_audio::LeAudioSinkTransport::interface = nullptr;
+      delete hidl::le_audio::LeAudioSinkTransport::instance;
+      hidl::le_audio::LeAudioSinkTransport::instance = nullptr;
+      delete sink;
+      sink = nullptr;
+
+      return nullptr;
+    }
+  } else {
+    aidl::SessionType session_type =
+        is_broadcasting_session_type
+            ? aidl::SessionType::LE_AUDIO_BROADCAST_SOFTWARE_ENCODING_DATAPATH
+            : aidl::SessionType::LE_AUDIO_SOFTWARE_ENCODING_DATAPATH;
+    if (CodecManager::GetInstance()->GetCodecLocation() !=
+        CodecLocation::HOST) {
+      session_type =
+          is_broadcasting_session_type
+              ? aidl::SessionType::
+                    LE_AUDIO_BROADCAST_HARDWARE_OFFLOAD_ENCODING_DATAPATH
+              : aidl::SessionType::LE_AUDIO_HARDWARE_OFFLOAD_ENCODING_DATAPATH;
+    }
+
+    if (session_type ==
+            aidl::SessionType::LE_AUDIO_HARDWARE_OFFLOAD_ENCODING_DATAPATH ||
+        session_type ==
+            aidl::SessionType::LE_AUDIO_SOFTWARE_ENCODING_DATAPATH) {
+      aidl::le_audio::LeAudioSinkTransport::instance_unicast_ =
+          new aidl::le_audio::LeAudioSinkTransport(session_type,
+                                                   std::move(stream_cb));
+      aidl::le_audio::LeAudioSinkTransport::interface_unicast_ =
+          new aidl::BluetoothAudioSinkClientInterface(
+              aidl::le_audio::LeAudioSinkTransport::instance_unicast_,
+              message_loop);
+      if (!aidl::le_audio::LeAudioSinkTransport::interface_unicast_
+               ->IsValid()) {
+        LOG(WARNING) << __func__
+                     << ": BluetoothAudio HAL for Le Audio is invalid?!";
+        delete aidl::le_audio::LeAudioSinkTransport::interface_unicast_;
+        aidl::le_audio::LeAudioSinkTransport::interface_unicast_ = nullptr;
+        delete aidl::le_audio::LeAudioSinkTransport::instance_unicast_;
+        aidl::le_audio::LeAudioSinkTransport::instance_unicast_ = nullptr;
+        delete sink;
+        sink = nullptr;
+
+        return nullptr;
+      }
+    } else {
+      aidl::le_audio::LeAudioSinkTransport::instance_broadcast_ =
+          new aidl::le_audio::LeAudioSinkTransport(session_type,
+                                                   std::move(stream_cb));
+      aidl::le_audio::LeAudioSinkTransport::interface_broadcast_ =
+          new aidl::BluetoothAudioSinkClientInterface(
+              aidl::le_audio::LeAudioSinkTransport::instance_broadcast_,
+              message_loop);
+      if (!aidl::le_audio::LeAudioSinkTransport::interface_broadcast_
+               ->IsValid()) {
+        LOG(WARNING) << __func__
+                     << ": BluetoothAudio HAL for Le Audio is invalid?!";
+        delete aidl::le_audio::LeAudioSinkTransport::interface_broadcast_;
+        aidl::le_audio::LeAudioSinkTransport::interface_broadcast_ = nullptr;
+        delete aidl::le_audio::LeAudioSinkTransport::instance_broadcast_;
+        aidl::le_audio::LeAudioSinkTransport::instance_broadcast_ = nullptr;
+        delete sink;
+        sink = nullptr;
+
+        return nullptr;
+      }
+    }
   }
 
-  return sink_;
+  return sink;
 }
 
-bool LeAudioClientInterface::IsSinkAcquired() { return sink_ != nullptr; }
+bool LeAudioClientInterface::IsUnicastSinkAcquired() {
+  return unicast_sink_ != nullptr;
+}
+bool LeAudioClientInterface::IsBroadcastSinkAcquired() {
+  return broadcast_sink_ != nullptr;
+}
 
 bool LeAudioClientInterface::ReleaseSink(LeAudioClientInterface::Sink* sink) {
-  if (sink != sink_) {
+  if (sink != unicast_sink_ && sink != broadcast_sink_) {
     LOG(WARNING) << __func__ << ", can't release not acquired sink";
     return false;
   }
 
-  if (le_audio_sink_hal_clientinterface && le_audio_sink) sink->Cleanup();
+  if ((hidl::le_audio::LeAudioSinkTransport::interface &&
+       hidl::le_audio::LeAudioSinkTransport::instance) ||
+      (aidl::le_audio::LeAudioSinkTransport::interface_unicast_ &&
+       aidl::le_audio::LeAudioSinkTransport::instance_unicast_) ||
+      (aidl::le_audio::LeAudioSinkTransport::interface_broadcast_ &&
+       aidl::le_audio::LeAudioSinkTransport::instance_broadcast_))
+    sink->Cleanup();
 
-  delete (sink_);
-  sink_ = nullptr;
+  if (sink == unicast_sink_) {
+    delete (unicast_sink_);
+    unicast_sink_ = nullptr;
+  } else if (sink == broadcast_sink_) {
+    delete (broadcast_sink_);
+    broadcast_sink_ = nullptr;
+  }
 
   return true;
 }
@@ -611,21 +771,61 @@ LeAudioClientInterface::Source* LeAudioClientInterface::GetSource(
 
   LOG(INFO) << __func__;
 
-  le_audio_source = new LeAudioSourceTransport(std::move(stream_cb));
-  le_audio_source_hal_clientinterface =
-      new bluetooth::audio::BluetoothAudioSourceClientInterface(le_audio_source,
-                                                                message_loop);
-  if (!le_audio_source_hal_clientinterface->IsValid()) {
-    LOG(WARNING) << __func__
-                 << ": BluetoothAudio HAL for Le Audio is invalid?!";
-    delete le_audio_source_hal_clientinterface;
-    le_audio_source_hal_clientinterface = nullptr;
-    delete le_audio_source;
-    le_audio_source = nullptr;
-    delete source_;
-    source_ = nullptr;
+  if (HalVersionManager::GetHalTransport() ==
+      BluetoothAudioHalTransport::HIDL) {
+    hidl::SessionType_2_1 session_type =
+        hidl::SessionType_2_1::LE_AUDIO_SOFTWARE_DECODED_DATAPATH;
+    if (CodecManager::GetInstance()->GetCodecLocation() !=
+        CodecLocation::HOST) {
+      session_type =
+          hidl::SessionType_2_1::LE_AUDIO_HARDWARE_OFFLOAD_DECODING_DATAPATH;
+    }
 
-    return nullptr;
+    hidl::le_audio::LeAudioSourceTransport::instance =
+        new hidl::le_audio::LeAudioSourceTransport(session_type,
+                                                   std::move(stream_cb));
+    hidl::le_audio::LeAudioSourceTransport::interface =
+        new hidl::BluetoothAudioSourceClientInterface(
+            hidl::le_audio::LeAudioSourceTransport::instance, message_loop);
+    if (!hidl::le_audio::LeAudioSourceTransport::interface->IsValid()) {
+      LOG(WARNING) << __func__
+                   << ": BluetoothAudio HAL for Le Audio is invalid?!";
+      delete hidl::le_audio::LeAudioSourceTransport::interface;
+      hidl::le_audio::LeAudioSourceTransport::interface = nullptr;
+      delete hidl::le_audio::LeAudioSourceTransport::instance;
+      hidl::le_audio::LeAudioSourceTransport::instance = nullptr;
+      delete source_;
+      source_ = nullptr;
+
+      return nullptr;
+    }
+  } else {
+    aidl::SessionType session_type =
+        aidl::SessionType::LE_AUDIO_SOFTWARE_DECODING_DATAPATH;
+    if (CodecManager::GetInstance()->GetCodecLocation() !=
+        CodecLocation::HOST) {
+      session_type =
+          aidl::SessionType::LE_AUDIO_HARDWARE_OFFLOAD_DECODING_DATAPATH;
+    }
+
+    aidl::le_audio::LeAudioSourceTransport::instance =
+        new aidl::le_audio::LeAudioSourceTransport(session_type,
+                                                   std::move(stream_cb));
+    aidl::le_audio::LeAudioSourceTransport::interface =
+        new aidl::BluetoothAudioSourceClientInterface(
+            aidl::le_audio::LeAudioSourceTransport::instance, message_loop);
+    if (!aidl::le_audio::LeAudioSourceTransport::interface->IsValid()) {
+      LOG(WARNING) << __func__
+                   << ": BluetoothAudio HAL for Le Audio is invalid?!";
+      delete aidl::le_audio::LeAudioSourceTransport::interface;
+      aidl::le_audio::LeAudioSourceTransport::interface = nullptr;
+      delete aidl::le_audio::LeAudioSourceTransport::instance;
+      aidl::le_audio::LeAudioSourceTransport::instance = nullptr;
+      delete source_;
+      source_ = nullptr;
+
+      return nullptr;
+    }
   }
 
   return source_;
@@ -640,7 +840,11 @@ bool LeAudioClientInterface::ReleaseSource(
     return false;
   }
 
-  if (le_audio_source_hal_clientinterface && le_audio_source) source->Cleanup();
+  if ((hidl::le_audio::LeAudioSourceTransport::interface &&
+       hidl::le_audio::LeAudioSourceTransport::instance) ||
+      (aidl::le_audio::LeAudioSourceTransport::interface &&
+       aidl::le_audio::LeAudioSourceTransport::instance))
+    source->Cleanup();
 
   delete (source_);
   source_ = nullptr;

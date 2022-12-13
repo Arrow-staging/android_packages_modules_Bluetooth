@@ -22,8 +22,10 @@
 
 #include <statslog_bt.h>
 
+#include "common/audit_log.h"
 #include "common/metric_id_manager.h"
 #include "common/strings.h"
+#include "hci/hci_packets.h"
 #include "os/log.h"
 
 namespace bluetooth {
@@ -32,6 +34,8 @@ namespace os {
 
 using bluetooth::common::MetricIdManager;
 using bluetooth::hci::Address;
+using bluetooth::hci::ErrorCode;
+using bluetooth::hci::EventCode;
 
 /**
  * nullptr and size 0 represent missing value for obfuscated_id
@@ -285,6 +289,10 @@ void LogMetricClassicPairingEvent(
         std::to_string(event_value).c_str(),
         ret);
   }
+
+  if (static_cast<EventCode>(hci_event) == EventCode::SIMPLE_PAIRING_COMPLETE) {
+    common::LogConnectionAdminAuditEvent("Pairing", address, static_cast<ErrorCode>(cmd_status));
+  }
 }
 
 void LogMetricSdpAttribute(
@@ -355,6 +363,7 @@ void LogMetricSocketConnectionState(
 
 void LogMetricManufacturerInfo(
     const Address& address,
+    android::bluetooth::AddressTypeEnum address_type,
     android::bluetooth::DeviceInfoSrcEnum source_type,
     const std::string& source_name,
     const std::string& manufacturer,
@@ -374,11 +383,16 @@ void LogMetricManufacturerInfo(
       model.c_str(),
       hardware_version.c_str(),
       software_version.c_str(),
-      metric_id);
+      metric_id,
+      address_type,
+      address.address[5],
+      address.address[4],
+      address.address[3]);
   if (ret < 0) {
     LOG_WARN(
-        "Failed for %s, source_type %d, source_name %s, manufacturer %s, model %s, hardware_version %s, "
-        "software_version %s, error %d",
+        "Failed for %s, source_type %d, source_name %s, manufacturer %s, model %s, "
+        "hardware_version %s, "
+        "software_version %s, MAC address type %d MAC address prefix %d %d %d, error %d",
         address.ToString().c_str(),
         source_type,
         source_name.c_str(),
@@ -386,6 +400,10 @@ void LogMetricManufacturerInfo(
         model.c_str(),
         hardware_version.c_str(),
         software_version.c_str(),
+        address_type,
+        address.address[5],
+        address.address[4],
+        address.address[3],
         ret);
   }
 }
@@ -403,6 +421,15 @@ void LogMetricBluetoothHalCrashReason(
         common::ToHexString(error_code).c_str(),
         common::ToHexString(vendor_error_code).c_str(),
         ret);
+  }
+}
+
+void LogMetricBluetoothCodePathCounterMetrics(int32_t key, int64_t count) {
+  int ret = stats_write(BLUETOOTH_CODE_PATH_COUNTER, key, count);
+  if (ret < 0) {
+    LOG_WARN(
+        "Failed counter metrics for %d, count %s, error %d",
+        key, std::to_string(count).c_str(), ret);
   }
 }
 

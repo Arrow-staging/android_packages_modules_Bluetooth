@@ -49,6 +49,10 @@ namespace bqr {
 //     When the controller encounters an error it shall report Root Inflammation
 //     event indicating the error code to the host.
 //
+//   [Vendor Specific Quality]
+//     Used for the controller vendor to define the vendor proprietary quality
+//     event(s).
+//
 //   [LMP/LL message trace]
 //     The controller sends the LMP/LL message handshaking with the remote
 //     device to the host.
@@ -63,22 +67,28 @@ namespace bqr {
 //     just can autonomously report debug logging information via the Controller
 //     Debug Info sub-event to the host.
 //
+//   [Vendor Specific Trace]
+//     Used for the controller vendor to define the vendor proprietary trace(s).
+//
 
 // Bit masks for the selected quality event reporting.
 static constexpr uint32_t kQualityEventMaskAllOff = 0;
-static constexpr uint32_t kQualityEventMaskMonitorMode = 0x00000001;
-static constexpr uint32_t kQualityEventMaskApproachLsto = 0x00000002;
-static constexpr uint32_t kQualityEventMaskA2dpAudioChoppy = 0x00000004;
-static constexpr uint32_t kQualityEventMaskScoVoiceChoppy = 0x00000008;
-static constexpr uint32_t kQualityEventMaskRootInflammation = 0x00000010;
-static constexpr uint32_t kQualityEventMaskLmpMessageTrace = 0x00010000;
-static constexpr uint32_t kQualityEventMaskBtSchedulingTrace = 0x00020000;
-static constexpr uint32_t kQualityEventMaskControllerDbgInfo = 0x00040000;
+static constexpr uint32_t kQualityEventMaskMonitorMode = 0x1 << 0;
+static constexpr uint32_t kQualityEventMaskApproachLsto = 0x1 << 1;
+static constexpr uint32_t kQualityEventMaskA2dpAudioChoppy = 0x1 << 2;
+static constexpr uint32_t kQualityEventMaskScoVoiceChoppy = 0x1 << 3;
+static constexpr uint32_t kQualityEventMaskRootInflammation = 0x1 << 4;
+static constexpr uint32_t kQualityEventMaskVendorSpecificQuality = 0x1 << 15;
+static constexpr uint32_t kQualityEventMaskLmpMessageTrace = 0x1 << 16;
+static constexpr uint32_t kQualityEventMaskBtSchedulingTrace = 0x1 << 17;
+static constexpr uint32_t kQualityEventMaskControllerDbgInfo = 0x1 << 18;
+static constexpr uint32_t kQualityEventMaskVendorSpecificTrace = 0x1 << 31;
 static constexpr uint32_t kQualityEventMaskAll =
     kQualityEventMaskMonitorMode | kQualityEventMaskApproachLsto |
     kQualityEventMaskA2dpAudioChoppy | kQualityEventMaskScoVoiceChoppy |
-    kQualityEventMaskRootInflammation | kQualityEventMaskLmpMessageTrace |
-    kQualityEventMaskBtSchedulingTrace | kQualityEventMaskControllerDbgInfo;
+    kQualityEventMaskRootInflammation | kQualityEventMaskVendorSpecificQuality |
+    kQualityEventMaskLmpMessageTrace | kQualityEventMaskBtSchedulingTrace |
+    kQualityEventMaskControllerDbgInfo | kQualityEventMaskVendorSpecificTrace;
 // Define the minimum time interval (in ms) of quality event reporting for the
 // selected quality event(s). Controller Firmware should not report the next
 // event within the defined time interval.
@@ -128,6 +138,8 @@ static int BtSchedulingTraceLogFd = INVALID_FD;
 static uint16_t LmpLlMessageTraceCounter = 0;
 // Counter of Bluetooth Multi-profile/Coex scheduling trace
 static uint16_t BtSchedulingTraceCounter = 0;
+// The version supports ISO packets start from v1.01(257)
+static constexpr uint16_t kBqrIsoVersion = 257;
 
 // Action definition
 //
@@ -147,9 +159,12 @@ enum BqrQualityReportId : uint8_t {
   QUALITY_REPORT_ID_A2DP_AUDIO_CHOPPY = 0x03,
   QUALITY_REPORT_ID_SCO_VOICE_CHOPPY = 0x04,
   QUALITY_REPORT_ID_ROOT_INFLAMMATION = 0x05,
+  QUALITY_REPORT_ID_LE_AUDIO_CHOPPY = 0x07,
+  QUALITY_REPORT_ID_VENDOR_SPECIFIC_QUALITY = 0x10,
   QUALITY_REPORT_ID_LMP_LL_MESSAGE_TRACE = 0x11,
   QUALITY_REPORT_ID_BT_SCHEDULING_TRACE = 0x12,
-  QUALITY_REPORT_ID_CONTROLLER_DBG_INFO = 0x13
+  QUALITY_REPORT_ID_CONTROLLER_DBG_INFO = 0x13,
+  QUALITY_REPORT_ID_VENDOR_SPECIFIC_TRACE = 0x20,
 };
 
 // Packet Type definition
@@ -181,7 +196,8 @@ enum BqrPacketType : uint8_t {
   PACKET_TYPE_2DH5,
   PACKET_TYPE_3DH1,
   PACKET_TYPE_3DH3,
-  PACKET_TYPE_3DH5
+  PACKET_TYPE_3DH5,
+  PACKET_TYPE_ISO = 0x51
 };
 
 // Configuration Parameters
@@ -242,8 +258,22 @@ typedef struct {
   uint32_t buffer_overflow_bytes;
   // Buffer underflow count (in byte).
   uint32_t buffer_underflow_bytes;
+  // The number of packets that are sent out.
+  uint32_t tx_total_packets;
+  // The number of packets that don't receive an acknowledgment.
+  uint32_t tx_unacked_packets;
+  // The number of packets that are not sent out by its flush point.
+  uint32_t tx_flushed_packets;
+  // The number of packets that Link Layer transmits a CIS Data PDU in the last
+  // subevent of a CIS event.
+  uint32_t tx_last_subevent_packets;
+  // The number of received packages with CRC error since the last event.
+  uint32_t crc_error_packets;
+  // The number of duplicate(retransmission) packages that are received since
+  // the last event.
+  uint32_t rx_duplicate_packets;
   // For the controller vendor to obtain more vendor specific parameters.
-  uint8_t* vendor_specific_parameter;
+  const uint8_t* vendor_specific_parameter;
 } BqrLinkQualityEvent;
 
 // Log dump related BQR event
@@ -253,7 +283,7 @@ typedef struct {
   // Connection handle of the connection.
   uint16_t connection_handle;
   // For the controller vendor to obtain more vendor specific parameters.
-  uint8_t* vendor_specific_parameter;
+  const uint8_t* vendor_specific_parameter;
 } BqrLogDumpEvent;
 
 // BQR sub-event of Vendor Specific Event
@@ -263,20 +293,21 @@ class BqrVseSubEvt {
   //
   // @param length Total length of all parameters contained in the sub-event.
   // @param p_param_buf A pointer to the parameters contained in the sub-event.
-  void ParseBqrLinkQualityEvt(uint8_t length, uint8_t* p_param_buf);
+  void ParseBqrLinkQualityEvt(uint8_t length, const uint8_t* p_param_buf);
   // Write the LMP/LL message trace to the log file.
   //
   // @param fd The File Descriptor of the log file.
   // @param length Total length of all parameters contained in the sub-event.
   // @param p_param_buf A pointer to the parameters contained in the sub-event.
-  void WriteLmpLlTraceLogFile(int fd, uint8_t length, uint8_t* p_param_buf);
+  void WriteLmpLlTraceLogFile(int fd, uint8_t length,
+                              const uint8_t* p_param_buf);
   // Write the Bluetooth Multi-profile/Coex scheduling trace to the log file.
   //
   // @param fd The File Descriptor of the log file.
   // @param length Total length of all parameters contained in the sub-event.
   // @param p_param_buf A pointer to the parameters contained in the sub-event.
   void WriteBtSchedulingTraceLogFile(int fd, uint8_t length,
-                                     uint8_t* p_param_buf);
+                                     const uint8_t* p_param_buf);
   // Get a string representation of the Bluetooth Quality event.
   //
   // @return a string representation of the Bluetooth Quality event.
@@ -343,19 +374,20 @@ void ConfigureBqrCmpl(uint32_t current_evt_mask);
 //   controller.
 // @param p_bqr_event A pointer to the BQR VSE sub-event which is sent from the
 //   Bluetooth controller.
-void CategorizeBqrEvent(uint8_t length, uint8_t* p_bqr_event);
+void CategorizeBqrEvent(uint8_t length, const uint8_t* p_bqr_event);
 
 // Record a new incoming Link Quality related BQR event in quality event queue.
 //
 // @param length Lengths of the Link Quality related BQR event.
 // @param p_link_quality_event A pointer to the Link Quality related BQR event.
-void AddLinkQualityEventToQueue(uint8_t length, uint8_t* p_link_quality_event);
+void AddLinkQualityEventToQueue(uint8_t length,
+                                const uint8_t* p_link_quality_event);
 
 // Dump the LMP/LL message handshaking with the remote device to a log file.
 //
 // @param length Lengths of the LMP/LL message trace event.
 // @param p_lmp_ll_message_event A pointer to the LMP/LL message trace event.
-void DumpLmpLlMessage(uint8_t length, uint8_t* p_lmp_ll_message_event);
+void DumpLmpLlMessage(uint8_t length, const uint8_t* p_lmp_ll_message_event);
 
 // Open the LMP/LL message trace log file.
 //
@@ -368,7 +400,7 @@ int OpenLmpLlTraceLogFile();
 //   event.
 // @param p_bt_scheduling_event A pointer to the Bluetooth Multi-profile/Coex
 //   scheduling trace event.
-void DumpBtScheduling(uint8_t length, uint8_t* p_bt_scheduling_event);
+void DumpBtScheduling(uint8_t length, const uint8_t* p_bt_scheduling_event);
 
 // Open the Bluetooth Multi-profile/Coex scheduling trace log file.
 //

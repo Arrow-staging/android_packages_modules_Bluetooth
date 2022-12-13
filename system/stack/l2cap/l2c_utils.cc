@@ -23,14 +23,11 @@
  ******************************************************************************/
 #define LOG_TAG "l2c_utils"
 
+#include <base/logging.h>
 #include <stdio.h>
 #include <string.h>
 
-#include "btm_api.h"
 #include "device/include/controller.h"
-#include "hci/include/btsnoop.h"
-#include "l2c_int.h"
-#include "l2cdefs.h"
 #include "main/shim/l2c_api.h"
 #include "main/shim/shim.h"
 #include "osi/include/allocator.h"
@@ -38,10 +35,13 @@
 #include "stack/btm/btm_sec.h"
 #include "stack/include/acl_api.h"
 #include "stack/include/bt_hdr.h"
+#include "stack/include/btm_api.h"
 #include "stack/include/hci_error_code.h"
+#include "stack/include/hcidefs.h"
+#include "stack/include/l2c_api.h"
+#include "stack/include/l2cdefs.h"
+#include "stack/l2cap/l2c_int.h"
 #include "types/raw_address.h"
-
-#include <base/logging.h>
 
 tL2C_CCB* l2cu_get_next_channel_in_rr(tL2C_LCB* p_lcb); // TODO Move
 
@@ -1489,31 +1489,44 @@ bool l2cu_start_post_bond_timer(uint16_t handle) {
   }
 
   tL2C_LCB* p_lcb = l2cu_find_lcb_by_handle(handle);
-
-  if (!p_lcb) return (true);
-
+  if (p_lcb == nullptr) {
+    LOG_WARN("Unable to find link control block for handle:0x%04x", handle);
+    return true;
+  }
   p_lcb->ResetBonding();
 
   /* Only start timer if no control blocks allocated */
-  if (p_lcb->ccb_queue.p_first_ccb != NULL) return (false);
-
-  /* If no channels on the connection, start idle timeout */
-  if ((p_lcb->link_state == LST_CONNECTED) ||
-      (p_lcb->link_state == LST_CONNECTING) ||
-      (p_lcb->link_state == LST_DISCONNECTING)) {
-    uint64_t timeout_ms = L2CAP_BONDING_TIMEOUT * 1000;
-
-    if (p_lcb->idle_timeout == 0) {
-      acl_disconnect_from_handle(p_lcb->Handle(), HCI_ERR_PEER_USER);
-      p_lcb->link_state = LST_DISCONNECTING;
-      timeout_ms = L2CAP_LINK_DISCONNECT_TIMEOUT_MS;
-    }
-    alarm_set_on_mloop(p_lcb->l2c_lcb_timer, timeout_ms, l2c_lcb_timer_timeout,
-                       p_lcb);
-    return (true);
+  if (p_lcb->ccb_queue.p_first_ccb != nullptr) {
+    LOG_DEBUG("Unable to start post bond timer with existing dynamic channels");
+    return false;
   }
 
-  return (false);
+  switch (p_lcb->link_state) {
+    case LST_CONNECTED:
+    case LST_CONNECTING:
+    case LST_DISCONNECTING: {
+      /* If no channels on the connection, start idle timeout */
+      uint64_t timeout_ms = L2CAP_BONDING_TIMEOUT * 1000;
+
+      if (p_lcb->idle_timeout == 0) {
+        acl_disconnect_from_handle(
+            p_lcb->Handle(), HCI_ERR_PEER_USER,
+            "stack::l2cap::l2c_utils::l2cu_start_post_bond_timer Idle timeout");
+        p_lcb->link_state = LST_DISCONNECTING;
+        timeout_ms = L2CAP_LINK_DISCONNECT_TIMEOUT_MS;
+      }
+      alarm_set_on_mloop(p_lcb->l2c_lcb_timer, timeout_ms,
+                         l2c_lcb_timer_timeout, p_lcb);
+      LOG_DEBUG("Started link IDLE timeout_ms:%lu", (unsigned long)timeout_ms);
+      return true;
+    } break;
+
+    default:
+      LOG_DEBUG("Will not start post bond timer with link state:%s",
+                link_state_text(p_lcb->link_state).c_str());
+      break;
+  }
+  return false;
 }
 
 /*******************************************************************************
@@ -1536,9 +1549,6 @@ void l2cu_release_ccb(tL2C_CCB* p_ccb) {
 
   /* If already released, could be race condition */
   if (!p_ccb->in_use) return;
-
-  btsnoop_get_interface()->clear_l2cap_allowlist(
-      p_lcb->Handle(), p_ccb->local_cid, p_ccb->remote_cid);
 
   if (p_rcb && (p_rcb->psm != p_rcb->real_psm)) {
     BTM_SecClrServiceByPsm(p_rcb->psm);
@@ -1576,6 +1586,9 @@ void l2cu_release_ccb(tL2C_CCB* p_ccb) {
 
   /* Flag as not in use */
   p_ccb->in_use = false;
+  // Clear Remote CID and Local Id
+  p_ccb->remote_cid = 0;
+  p_ccb->local_id = 0;
 
   /* If no channels on the connection, start idle timeout */
   if ((p_lcb) && p_lcb->in_use) {
@@ -2203,6 +2216,73 @@ bool l2cu_lcb_disconnecting(void) {
 
 /*******************************************************************************
  *
+ * Function         l2cu_set_acl_priority_latency_brcm
+ *
+ * Description      Sends a VSC to set the ACL priority and recorded latency on
+ *                  Broadcom chip.
+ *
+ * Returns          void
+ *
+ ******************************************************************************/
+
+static void l2cu_set_acl_priority_latency_brcm(tL2C_LCB* p_lcb,
+                                               tL2CAP_PRIORITY priority) {
+  uint8_t vs_param;
+  if (priority == L2CAP_PRIORITY_HIGH) {
+    // priority to high, if using latency mode check preset latency
+    if (p_lcb->use_latency_mode &&
+        p_lcb->preset_acl_latency == L2CAP_LATENCY_LOW) {
+      LOG_INFO("Set ACL priority: High Priority and Low Latency Mode");
+      vs_param = HCI_BRCM_ACL_HIGH_PRIORITY_LOW_LATENCY;
+      p_lcb->set_latency(L2CAP_LATENCY_LOW);
+    } else {
+      LOG_INFO("Set ACL priority: High Priority Mode");
+      vs_param = HCI_BRCM_ACL_HIGH_PRIORITY;
+    }
+  } else {
+    // priority to normal
+    LOG_INFO("Set ACL priority: Normal Mode");
+    vs_param = HCI_BRCM_ACL_NORMAL_PRIORITY;
+    p_lcb->set_latency(L2CAP_LATENCY_NORMAL);
+  }
+
+  uint8_t command[HCI_BRCM_ACL_PRIORITY_PARAM_SIZE];
+  uint8_t* pp = command;
+  UINT16_TO_STREAM(pp, p_lcb->Handle());
+  UINT8_TO_STREAM(pp, vs_param);
+
+  BTM_VendorSpecificCommand(HCI_BRCM_SET_ACL_PRIORITY,
+                            HCI_BRCM_ACL_PRIORITY_PARAM_SIZE, command, NULL);
+}
+
+/*******************************************************************************
+ *
+ * Function         l2cu_set_acl_priority_syna
+ *
+ * Description      Sends a VSC to set the ACL priority on Synaptics chip.
+ *
+ * Returns          void
+ *
+ ******************************************************************************/
+
+static void l2cu_set_acl_priority_syna(uint16_t handle,
+                                       tL2CAP_PRIORITY priority) {
+  uint8_t* pp;
+  uint8_t command[HCI_SYNA_ACL_PRIORITY_PARAM_SIZE];
+  uint8_t vs_param;
+
+  pp = command;
+  vs_param = (priority == L2CAP_PRIORITY_HIGH) ? HCI_SYNA_ACL_PRIORITY_HIGH
+                                               : HCI_SYNA_ACL_PRIORITY_LOW;
+  UINT16_TO_STREAM(pp, handle);
+  UINT8_TO_STREAM(pp, vs_param);
+
+  BTM_VendorSpecificCommand(HCI_SYNA_SET_ACL_PRIORITY,
+                            HCI_SYNA_ACL_PRIORITY_PARAM_SIZE, command, NULL);
+}
+
+/*******************************************************************************
+ *
  * Function         l2cu_set_acl_priority
  *
  * Description      Sets the transmission priority for a channel.
@@ -2216,9 +2296,6 @@ bool l2cu_lcb_disconnecting(void) {
 bool l2cu_set_acl_priority(const RawAddress& bd_addr, tL2CAP_PRIORITY priority,
                            bool reset_after_rs) {
   tL2C_LCB* p_lcb;
-  uint8_t* pp;
-  uint8_t command[HCI_BRCM_ACL_PRIORITY_PARAM_SIZE];
-  uint8_t vs_param;
 
   APPL_TRACE_EVENT("SET ACL PRIORITY %d", priority);
 
@@ -2229,24 +2306,24 @@ bool l2cu_set_acl_priority(const RawAddress& bd_addr, tL2CAP_PRIORITY priority,
     return (false);
   }
 
-  if (controller_get_interface()->get_bt_version()->manufacturer ==
-      LMP_COMPID_BROADCOM) {
-    /* Called from above L2CAP through API; send VSC if changed */
-    if ((!reset_after_rs && (priority != p_lcb->acl_priority)) ||
-        /* Called because of a central/peripheral role switch; if high resend
-           VSC */
-        (reset_after_rs && p_lcb->acl_priority == L2CAP_PRIORITY_HIGH)) {
-      pp = command;
+  /* Link priority is set if:
+   * 1. Change in priority requested from above L2CAP through API, Or
+   * 2. High priority requested because of central/peripheral role switch */
+  if ((!reset_after_rs && (priority != p_lcb->acl_priority)) ||
+      (reset_after_rs && p_lcb->acl_priority == L2CAP_PRIORITY_HIGH)) {
+    /* Use vendor specific commands to set the link priority */
+    switch (controller_get_interface()->get_bt_version()->manufacturer) {
+      case LMP_COMPID_BROADCOM:
+        l2cu_set_acl_priority_latency_brcm(p_lcb, priority);
+        break;
 
-      vs_param = (priority == L2CAP_PRIORITY_HIGH) ? HCI_BRCM_ACL_PRIORITY_HIGH
-                                                   : HCI_BRCM_ACL_PRIORITY_LOW;
+      case LMP_COMPID_SYNAPTICS:
+        l2cu_set_acl_priority_syna(p_lcb->Handle(), priority);
+        break;
 
-      UINT16_TO_STREAM(pp, p_lcb->Handle());
-      UINT8_TO_STREAM(pp, vs_param);
-
-      BTM_VendorSpecificCommand(HCI_BRCM_SET_ACL_PRIORITY,
-                                HCI_BRCM_ACL_PRIORITY_PARAM_SIZE, command,
-                                NULL);
+      default:
+        /* Not supported/required for other vendors */
+        break;
     }
   }
 
@@ -2256,6 +2333,72 @@ bool l2cu_set_acl_priority(const RawAddress& bd_addr, tL2CAP_PRIORITY priority,
     l2c_link_adjust_allocation();
   }
   return (true);
+}
+
+/*******************************************************************************
+ *
+ * Function         l2cu_set_acl_latency_brcm
+ *
+ * Description      Sends a VSC to set the ACL latency on Broadcom chip.
+ *
+ * Returns          void
+ *
+ ******************************************************************************/
+
+static void l2cu_set_acl_latency_brcm(tL2C_LCB* p_lcb, tL2CAP_LATENCY latency) {
+  LOG_INFO("Set ACL latency: %s",
+           latency == L2CAP_LATENCY_LOW ? "Low Latancy" : "Normal Latency");
+
+  uint8_t command[HCI_BRCM_ACL_PRIORITY_PARAM_SIZE];
+  uint8_t* pp = command;
+  uint8_t vs_param = latency == L2CAP_LATENCY_LOW
+                         ? HCI_BRCM_ACL_HIGH_PRIORITY_LOW_LATENCY
+                         : HCI_BRCM_ACL_HIGH_PRIORITY;
+  UINT16_TO_STREAM(pp, p_lcb->Handle());
+  UINT8_TO_STREAM(pp, vs_param);
+
+  BTM_VendorSpecificCommand(HCI_BRCM_SET_ACL_PRIORITY,
+                            HCI_BRCM_ACL_PRIORITY_PARAM_SIZE, command, NULL);
+}
+
+/*******************************************************************************
+ *
+ * Function         l2cu_set_acl_latency
+ *
+ * Description      Sets the transmission latency for a channel.
+ *
+ * Returns          true if a valid channel, else false
+ *
+ ******************************************************************************/
+
+bool l2cu_set_acl_latency(const RawAddress& bd_addr, tL2CAP_LATENCY latency) {
+  LOG_INFO("Set ACL low latency: %d", latency);
+
+  /* Find the link control block for the acl channel */
+  tL2C_LCB* p_lcb = l2cu_find_lcb_by_bd_addr(bd_addr, BT_TRANSPORT_BR_EDR);
+
+  if (p_lcb == nullptr) {
+    LOG_WARN("Set latency failed: LCB is null");
+    return false;
+  }
+  /* only change controller's latency when stream using latency mode */
+  if (p_lcb->use_latency_mode && p_lcb->is_high_priority() &&
+      latency != p_lcb->acl_latency) {
+    switch (controller_get_interface()->get_bt_version()->manufacturer) {
+      case LMP_COMPID_BROADCOM:
+        l2cu_set_acl_latency_brcm(p_lcb, latency);
+        break;
+
+      default:
+        /* Not supported/required for other vendors */
+        break;
+    }
+    p_lcb->set_latency(latency);
+  }
+  /* save the latency mode even if acl does not use latency mode or start*/
+  p_lcb->preset_acl_latency = latency;
+
+  return true;
 }
 
 /******************************************************************************
@@ -2479,7 +2622,9 @@ void l2cu_no_dynamic_ccbs(tL2C_LCB* p_lcb) {
     L2CAP_TRACE_DEBUG(
         "l2cu_no_dynamic_ccbs() IDLE timer 0, disconnecting link");
 
-    rc = btm_sec_disconnect(p_lcb->Handle(), HCI_ERR_PEER_USER);
+    rc = btm_sec_disconnect(
+        p_lcb->Handle(), HCI_ERR_PEER_USER,
+        "stack::l2cap::l2c_utils::l2cu_no_dynamic_ccbs Idle timer popped");
     if (rc == BTM_CMD_STARTED) {
       l2cu_process_fixed_disc_cback(p_lcb);
       p_lcb->link_state = LST_DISCONNECTING;
@@ -2491,7 +2636,9 @@ void l2cu_no_dynamic_ccbs(tL2C_LCB* p_lcb) {
       p_lcb->link_state = LST_DISCONNECTING;
       start_timeout = false;
     } else if (p_lcb->IsBonding()) {
-      acl_disconnect_from_handle(p_lcb->Handle(), HCI_ERR_PEER_USER);
+      acl_disconnect_from_handle(
+          p_lcb->Handle(), HCI_ERR_PEER_USER,
+          "stack::l2cap::l2c_utils::l2cu_no_dynamic_ccbs Bonding no traffic");
       l2cu_process_fixed_disc_cback(p_lcb);
       p_lcb->link_state = LST_DISCONNECTING;
       timeout_ms = L2CAP_LINK_DISCONNECT_TIMEOUT_MS;
@@ -2502,9 +2649,9 @@ void l2cu_no_dynamic_ccbs(tL2C_LCB* p_lcb) {
   }
 
   if (start_timeout) {
-    L2CAP_TRACE_DEBUG("%s starting IDLE timeout: %d ms", __func__, timeout_ms);
     alarm_set_on_mloop(p_lcb->l2c_lcb_timer, timeout_ms, l2c_lcb_timer_timeout,
                        p_lcb);
+    LOG_DEBUG("Started link IDLE timeout_ms:%lu", (unsigned long)timeout_ms);
   } else {
     alarm_cancel(p_lcb->l2c_lcb_timer);
   }
@@ -2943,7 +3090,7 @@ void l2cu_reject_ble_connection(tL2C_CCB* p_ccb, uint8_t rem_id,
                                 uint16_t result) {
   if (p_ccb->ecoc)
     l2cu_reject_credit_based_conn_req(
-        p_ccb->p_lcb, rem_id, p_ccb->p_lcb->pending_ecoc_reconfig_cnt, result);
+        p_ccb->p_lcb, rem_id, p_ccb->p_lcb->pending_ecoc_conn_cnt, result);
   else
     l2cu_reject_ble_coc_connection(p_ccb->p_lcb, rem_id, result);
 }

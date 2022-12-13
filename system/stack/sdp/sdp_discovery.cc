@@ -280,7 +280,7 @@ static void process_service_search_rsp(tCONN_CB* p_ccb, uint8_t* p_reply,
 
   orig = p_ccb->num_handles;
   p_ccb->num_handles += cur_handles;
-  if (p_ccb->num_handles == 0) {
+  if (p_ccb->num_handles == 0 || p_ccb->num_handles < orig) {
     SDP_TRACE_WARNING("SDP - Rcvd ServiceSearchRsp, no matches");
     sdp_disconnect(p_ccb, SDP_NO_RECS_MATCH);
     return;
@@ -408,6 +408,11 @@ static void process_service_attr_rsp(tCONN_CB* p_ccb, uint8_t* p_reply,
     /* Copy the response to the scratchpad. First, a safety check on the length
      */
     if ((p_ccb->list_len + list_byte_count) > SDP_MAX_LIST_BYTE_COUNT) {
+      sdp_disconnect(p_ccb, SDP_INVALID_PDU_SIZE);
+      return;
+    }
+
+    if (p_reply + list_byte_count + 1 /* continuation */ > p_reply_end) {
       sdp_disconnect(p_ccb, SDP_INVALID_PDU_SIZE);
       return;
     }
@@ -636,6 +641,8 @@ static void process_service_search_attr_rsp(tCONN_CB* p_ccb, uint8_t* p_reply,
 
   if ((type >> 3) != DATA_ELE_SEQ_DESC_TYPE) {
     LOG_WARN("Wrong element in attr_rsp type:0x%02x", type);
+    android_errorWriteLog(0x534e4554, "224545125");
+    sdp_disconnect(p_ccb, SDP_ILLEGAL_PARAMETER);
     return;
   }
   p = sdpu_get_len_from_type(p, p + p_ccb->list_len, type, &seq_len);

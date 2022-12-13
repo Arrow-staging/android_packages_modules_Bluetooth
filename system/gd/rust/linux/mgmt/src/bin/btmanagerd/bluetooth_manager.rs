@@ -1,4 +1,4 @@
-use log::{error, info};
+use log::{error, info, warn};
 
 use manager_service::iface_bluetooth_manager::{
     AdapterWithEnabled, IBluetoothManager, IBluetoothManagerCallback,
@@ -61,6 +61,11 @@ impl BluetoothManager {
     pub(crate) fn callback_disconnected(&mut self, id: u32) {
         self.callbacks.remove(&id);
     }
+
+    pub(crate) fn get_floss_enabled_internal(&mut self) -> bool {
+        let enabled = self.manager_context.floss_enabled.load(Ordering::Relaxed);
+        enabled
+    }
 }
 
 impl IBluetoothManager for BluetoothManager {
@@ -115,18 +120,16 @@ impl IBluetoothManager for BluetoothManager {
     }
 
     fn get_floss_enabled(&mut self) -> bool {
-        let enabled = self.manager_context.floss_enabled.load(Ordering::Relaxed);
-        enabled
+        self.get_floss_enabled_internal()
     }
 
     fn set_floss_enabled(&mut self, enabled: bool) {
         let prev = self.manager_context.floss_enabled.swap(enabled, Ordering::Relaxed);
         config_util::write_floss_enabled(enabled);
         if prev != enabled && enabled {
-            Command::new("initctl")
-                .args(&["stop", BLUEZ_INIT_TARGET])
-                .output()
-                .expect("failed to stop bluetoothd");
+            if let Err(e) = Command::new("initctl").args(&["stop", BLUEZ_INIT_TARGET]).output() {
+                warn!("Failed to stop bluetoothd: {}", e);
+            }
             // TODO: Implement multi-hci case
             let default_device = config_util::list_hci_devices()[0];
             if config_util::is_hci_n_enabled(default_device) {
@@ -136,10 +139,9 @@ impl IBluetoothManager for BluetoothManager {
             // TODO: Implement multi-hci case
             let default_device = config_util::list_hci_devices()[0];
             self.manager_context.proxy.stop_bluetooth(default_device);
-            Command::new("initctl")
-                .args(&["start", BLUEZ_INIT_TARGET])
-                .output()
-                .expect("failed to start bluetoothd");
+            if let Err(e) = Command::new("initctl").args(&["start", BLUEZ_INIT_TARGET]).output() {
+                warn!("Failed to start bluetoothd: {}", e);
+            }
         }
     }
 

@@ -9,7 +9,10 @@ package {
 
 rust_binary_host {
     name: "bt_topshim_facade",
-    defaults: ["gd_rust_defaults"],
+    defaults: [
+        "gd_rust_defaults",
+        "libchrome_support_defaults"
+    ],
     crate_name: "bt_topshim_facade",
     srcs: ["src/main.rs"],
     ld_flags: ["-fsanitize=undefined", "-fsanitize-minimal-runtime"],
@@ -29,15 +32,21 @@ rust_binary_host {
         "libbt_shim",
     ],
     static_libs: [
+        "avrcp-target-service",
+        "lib-bt-packets",
+        "lib-bt-packets-avrcp",
+        "lib-bt-packets-base",
+        "libchrome",
+        "libevent",
         "libbt_topshim_cxx",
         "libbt-bta",
         "libbt-common",
         "libbtdevice",
-        "libbtif-static",
+        "libbtif",
         "libbt-hci",
         "libbt-stack",
         "libbt-utils",
-        "libbtcore-static",
+        "libbtcore",
         "libosi",
         "libbt-protos-lite",
         "libbte",
@@ -45,17 +54,21 @@ rust_binary_host {
         "libbt-sbc-encoder",
         "libFraunhoferAAC",
         "libg722codec",
-        "liblc3codec",
+        "liblc3",
+        "libopus",
         "libudrv-uipc",
         "libbluetooth_gd", // Gabeldorsche
         "libbluetooth-dumpsys",
         "libbluetooth-types",
         "libflatbuffers-cpp",
         "libbt_shim_bridge",
+        "libbt_topshim_cxx",
+        "libbt-audio-hal-interface",
+        "libaudio-a2dp-hw-utils",
+        "libc++fs",
     ],
     shared_libs: [
         "libcrypto",
-        "libchrome",
         "liblog",
         "libcutils",
         "libgrpc++",
@@ -64,24 +77,4 @@ rust_binary_host {
     proc_macros: [
         "libpaste",
     ],
-}
-
-rust_protobuf {
-    name: "libbt_topshim_facade_protobuf",
-    crate_name: "bt_topshim_facade_protobuf",
-    source_stem: "topshim_facade",
-    host_supported: true,
-    grpc_protos: ["facade.proto"],
-}
-
-genrule {
-    name: "libbt_topshim_facade_py_proto",
-    tools: [
-        "aprotoc",
-        "protoc-gen-grpc-python-plugin",
-        "soong_zip",
-    ],
-    cmd: "$(location aprotoc) --plugin=protoc-gen-grpc=$(location protoc-gen-grpc-python-plugin) -Ipackages/modules/Bluetooth/system/gd/rust/topshim/facade $(in) --grpc_out=$(genDir) --python_out=$(genDir)",
-    srcs: ["facade.proto"],
-    out: ["facade_pb2.py", "facade_pb2_grpc.py"],
 }

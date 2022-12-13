@@ -18,39 +18,64 @@
 package android.bluetooth;
 
 import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothLeAudioCodecConfig;
+import android.bluetooth.BluetoothLeAudioContentMetadata;
+import android.bluetooth.IBluetoothLeAudioCallback;
+import android.bluetooth.IBluetoothLeBroadcastCallback;
 import android.content.AttributionSource;
+
+import com.android.modules.utils.SynchronousResultReceiver;
+
+import android.os.ParcelUuid;
 
 /**
  * APIs for Bluetooth LE Audio service
  *
  * @hide
  */
-interface IBluetoothLeAudio {
+oneway interface IBluetoothLeAudio {
     // Public API
     @JavaPassthrough(annotation="@android.annotation.RequiresPermission(android.Manifest.permission.BLUETOOTH_CONNECT)")
-    boolean connect(in BluetoothDevice device, in AttributionSource attributionSource);
+    void connect(in BluetoothDevice device, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
     @JavaPassthrough(annotation="@android.annotation.RequiresPermission(android.Manifest.permission.BLUETOOTH_CONNECT)")
-    boolean disconnect(in BluetoothDevice device, in AttributionSource attributionSource);
+    void disconnect(in BluetoothDevice device, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
     @JavaPassthrough(annotation="@android.annotation.RequiresPermission(android.Manifest.permission.BLUETOOTH_CONNECT)")
-    List<BluetoothDevice> getConnectedDevices(in AttributionSource attributionSource);
+    void getConnectedDevices(in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
     @JavaPassthrough(annotation="@android.annotation.RequiresPermission(android.Manifest.permission.BLUETOOTH_CONNECT)")
-    List<BluetoothDevice> getDevicesMatchingConnectionStates(in int[] states, in AttributionSource attributionSource);
+    void getDevicesMatchingConnectionStates(in int[] states, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
     @JavaPassthrough(annotation="@android.annotation.RequiresPermission(android.Manifest.permission.BLUETOOTH_CONNECT)")
-    int getConnectionState(in BluetoothDevice device, in AttributionSource attributionSource);
+    void getConnectionState(in BluetoothDevice device, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
     @JavaPassthrough(annotation="@android.annotation.RequiresPermission(android.Manifest.permission.BLUETOOTH_CONNECT)")
-    boolean setActiveDevice(in BluetoothDevice device, in AttributionSource attributionSource);
+    void setActiveDevice(in BluetoothDevice device, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
     @JavaPassthrough(annotation="@android.annotation.RequiresPermission(android.Manifest.permission.BLUETOOTH_CONNECT)")
-    List<BluetoothDevice> getActiveDevices(in AttributionSource attributionSource);
+    void getActiveDevices(in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
     @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT,android.Manifest.permission.BLUETOOTH_PRIVILEGED})")
-    boolean setConnectionPolicy(in BluetoothDevice device, int connectionPolicy, in AttributionSource attributionSource);
+    void setConnectionPolicy(in BluetoothDevice device, int connectionPolicy, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
     @JavaPassthrough(annotation="@android.annotation.RequiresPermission(android.Manifest.permission.BLUETOOTH_CONNECT)")
-    int getConnectionPolicy(in BluetoothDevice device, in AttributionSource attributionSource);
+    void getConnectionPolicy(in BluetoothDevice device, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(android.Manifest.permission.BLUETOOTH_CONNECT)")
+    void getConnectedGroupLeadDevice(int groupId, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(android.Manifest.permission.BLUETOOTH_CONNECT)")
+    void getCodecStatus(in int groupId, in AttributionSource source, in SynchronousResultReceiver receiver);
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(android.Manifest.permission.BLUETOOTH_CONNECT)")
+    void setCodecConfigPreference(in int groupId, in BluetoothLeAudioCodecConfig inputCodecConfig, in BluetoothLeAudioCodecConfig outputCodecConfig, in AttributionSource source);
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT,android.Manifest.permission.BLUETOOTH_PRIVILEGED})")
+    void registerCallback(in IBluetoothLeAudioCallback callback, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT,android.Manifest.permission.BLUETOOTH_PRIVILEGED})")
+    void unregisterCallback(in IBluetoothLeAudioCallback callback, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT,android.Manifest.permission.BLUETOOTH_PRIVILEGED})")
+    void setCcidInformation(in ParcelUuid userUuid, in int ccid, in int contextType, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT,android.Manifest.permission.BLUETOOTH_PRIVILEGED})")
+    void setInCall(in boolean inCall, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT,android.Manifest.permission.BLUETOOTH_PRIVILEGED})")
+    void setInactiveForHfpHandover(in BluetoothDevice device, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
 
     /* Same value as bluetooth::groups::kGroupUnknown */
     const int LE_AUDIO_GROUP_ID_INVALID = -1;
 
     const int GROUP_STATUS_INACTIVE = 0;
     const int GROUP_STATUS_ACTIVE = 1;
+    const int GROUP_STATUS_TURNED_IDLE_DURING_CALL = 2;
 
     const int GROUP_NODE_ADDED = 1;
     const int GROUP_NODE_REMOVED = 2;
@@ -60,11 +85,31 @@ interface IBluetoothLeAudio {
      * earbud)
      */
     @JavaPassthrough(annotation="@android.annotation.RequiresPermission(android.Manifest.permission.BLUETOOTH_CONNECT)")
-    int getGroupId(in BluetoothDevice device, in AttributionSource attributionSource);
+    void getGroupId(in BluetoothDevice device, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
     @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT,android.Manifest.permission.BLUETOOTH_PRIVILEGED})")
-    void setVolume(int volume, in AttributionSource attributionSource);
+    void setVolume(int volume, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
     @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT,android.Manifest.permission.BLUETOOTH_PRIVILEGED})")
-    boolean groupAddNode(int group_id, in BluetoothDevice device, in AttributionSource attributionSource);
+    void groupAddNode(int group_id, in BluetoothDevice device, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
     @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT,android.Manifest.permission.BLUETOOTH_PRIVILEGED})")
-    boolean groupRemoveNode(int group_id, in BluetoothDevice device, in AttributionSource attributionSource);
+    void groupRemoveNode(int group_id, in BluetoothDevice device, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT,android.Manifest.permission.BLUETOOTH_PRIVILEGED})")
+    void getAudioLocation(in BluetoothDevice device, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
+
+    // Broadcaster API
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT,android.Manifest.permission.BLUETOOTH_PRIVILEGED})")
+    void registerLeBroadcastCallback(in IBluetoothLeBroadcastCallback callback, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT,android.Manifest.permission.BLUETOOTH_PRIVILEGED})")
+    void unregisterLeBroadcastCallback(in IBluetoothLeBroadcastCallback callback, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT,android.Manifest.permission.BLUETOOTH_PRIVILEGED})")
+    void startBroadcast(in BluetoothLeAudioContentMetadata contentMetadata, in byte[] broadcastCode, in AttributionSource attributionSource);
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT,android.Manifest.permission.BLUETOOTH_PRIVILEGED})")
+    void stopBroadcast(int broadcastId, in AttributionSource attributionSource);
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT,android.Manifest.permission.BLUETOOTH_PRIVILEGED})")
+    void updateBroadcast(int broadcastId, in BluetoothLeAudioContentMetadata contentMetadata, in AttributionSource attributionSource);
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT})")
+    void isPlaying(int broadcastId, in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT,android.Manifest.permission.BLUETOOTH_PRIVILEGED})")
+    void getAllBroadcastMetadata(in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
+    @JavaPassthrough(annotation="@android.annotation.RequiresPermission(allOf={android.Manifest.permission.BLUETOOTH_CONNECT})")
+    void getMaximumNumberOfBroadcasts(in AttributionSource attributionSource, in SynchronousResultReceiver receiver);
 }

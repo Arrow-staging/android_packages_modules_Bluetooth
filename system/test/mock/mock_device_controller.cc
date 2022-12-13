@@ -233,6 +233,10 @@ bool supports_encryption_pause(void) {
   return HCI_ATOMIC_ENCRYPT_SUPPORTED(features_classic[0].as_array);
 }
 
+bool supports_configure_data_path(void) {
+  return HCI_CONFIGURE_DATA_PATH_SUPPORTED(supported_commands);
+}
+
 bool supports_ble(void) { return ble_supported; }
 
 bool supports_ble_privacy(void) {
@@ -363,6 +367,8 @@ uint8_t get_le_all_initiating_phys() {
   return phy;
 }
 
+tBTM_STATUS clear_event_filter() { return BTM_SUCCESS; }
+
 const controller_t interface = {
     get_is_ready,
 
@@ -403,6 +409,7 @@ const controller_t interface = {
     supports_non_flushable_pb,
     supports_sniff_subrating,
     supports_encryption_pause,
+    supports_configure_data_path,
 
     supports_ble,
     supports_ble_packet_extension,
@@ -446,7 +453,8 @@ const controller_t interface = {
     get_ble_resolving_list_max_size,
     set_ble_resolving_list_max_size,
     get_local_supported_codecs,
-    get_le_all_initiating_phys};
+    get_le_all_initiating_phys,
+    clear_event_filter};
 
 }  // namespace device_controller
 }  // namespace mock

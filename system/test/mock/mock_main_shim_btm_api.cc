@@ -87,7 +87,8 @@ bool bluetooth::shim::BTM_ReadRemoteConnectionAddr(
   return false;
 }
 bool bluetooth::shim::BTM_SecAddDevice(const RawAddress& bd_addr,
-                                       DEV_CLASS dev_class, BD_NAME bd_name,
+                                       DEV_CLASS dev_class,
+                                       const BD_NAME& bd_name,
                                        uint8_t* features, LinkKey* link_key,
                                        uint8_t key_type, uint8_t pin_length) {
   mock_function_count_map[__func__]++;
@@ -213,10 +214,6 @@ tBTM_STATUS bluetooth::shim::BTM_SetInquiryMode(uint8_t inquiry_mode) {
 }
 tBTM_STATUS bluetooth::shim::BTM_StartInquiry(tBTM_INQ_RESULTS_CB* p_results_cb,
                                               tBTM_CMPL_CB* p_cmpl_cb) {
-  mock_function_count_map[__func__]++;
-  return BTM_SUCCESS;
-}
-tBTM_STATUS bluetooth::shim::BTM_WriteEIR(BT_HDR* p_buff) {
   mock_function_count_map[__func__]++;
   return BTM_SUCCESS;
 }
@@ -386,10 +383,6 @@ void bluetooth::shim::BTM_RemoteOobDataReply(tBTM_STATUS res,
                                              const Octet16& r) {
   mock_function_count_map[__func__]++;
 }
-void bluetooth::shim::BTM_RemoveEirService(uint32_t* p_eir_uuid,
-                                           uint16_t uuid16) {
-  mock_function_count_map[__func__]++;
-}
 void bluetooth::shim::BTM_SecAddBleDevice(const RawAddress& bd_addr,
                                           tBT_DEVICE_TYPE dev_type,
                                           tBLE_ADDR_TYPE addr_type) {
@@ -430,4 +423,14 @@ void btm_api_process_inquiry_result_with_rssi(RawAddress raw_address,
                                               uint16_t clock_offset,
                                               int8_t rssi) {
   mock_function_count_map[__func__]++;
+}
+
+tBTM_STATUS bluetooth::shim::BTM_ClearEventFilter() {
+  mock_function_count_map[__func__]++;
+  return BTM_SUCCESS;
+}
+
+tBTM_STATUS bluetooth::shim::BTM_BleResetId() {
+  mock_function_count_map[__func__]++;
+  return BTM_SUCCESS;
 }

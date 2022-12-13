@@ -14,11 +14,25 @@
 //  limitations under the License.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    generate_packets();
+    let packets_prebuilt = match env::var("HCI_PACKETS_PREBUILT") {
+        Ok(dir) => PathBuf::from(dir),
+        Err(_) => PathBuf::from("hci_packets.rs"),
+    };
+    if Path::new(packets_prebuilt.as_os_str()).exists() {
+        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+        let outputted = out_dir.join("../../hci/hci_packets.rs");
+        std::fs::copy(
+            packets_prebuilt.as_os_str().to_str().unwrap(),
+            out_dir.join(outputted.file_name().unwrap()).as_os_str().to_str().unwrap(),
+        )
+        .unwrap();
+    } else {
+        generate_packets();
+    }
 }
 
 fn generate_packets() {
@@ -34,8 +48,17 @@ fn generate_packets() {
     let outputted = [out_dir.join("../../hci/hci_packets.rs")];
 
     // Find the packetgen tool. Expecting it at CARGO_HOME/bin
-    let packetgen =
-        PathBuf::from(env::var("CARGO_HOME").unwrap()).join("bin").join("bluetooth_packetgen");
+    let packetgen = match env::var("CARGO_HOME") {
+        Ok(dir) => PathBuf::from(dir).join("bin").join("bluetooth_packetgen"),
+        Err(_) => PathBuf::from("bluetooth_packetgen"),
+    };
+
+    if !Path::new(packetgen.as_os_str()).exists() {
+        panic!(
+            "Unable to locate bluetooth packet generator:{:?}",
+            packetgen.as_os_str().to_str().unwrap()
+        );
+    }
 
     for i in 0..input_files.len() {
         let output = Command::new(packetgen.as_os_str().to_str().unwrap())

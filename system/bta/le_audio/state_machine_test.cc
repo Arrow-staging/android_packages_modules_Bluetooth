@@ -22,11 +22,15 @@
 
 #include <functional>
 
+#include "bta/le_audio/content_control_id_keeper.h"
 #include "bta_gatt_api_mock.h"
 #include "bta_gatt_queue_mock.h"
 #include "btm_api_mock.h"
 #include "client_parser.h"
 #include "fake_osi.h"
+#include "gd/common/init_flags.h"
+#include "le_audio_set_configuration_provider.h"
+#include "mock_codec_manager.h"
 #include "mock_controller.h"
 #include "mock_iso_manager.h"
 #include "types/bt_transport.h"
@@ -36,13 +40,20 @@ using ::testing::AnyNumber;
 using ::testing::AtLeast;
 using ::testing::DoAll;
 using ::testing::Invoke;
+using ::testing::NiceMock;
 using ::testing::Return;
 using ::testing::SaveArg;
 using ::testing::Test;
 
 std::map<std::string, int> mock_function_count_map;
-
 extern struct fake_osi_alarm_set_on_mloop fake_osi_alarm_set_on_mloop_;
+
+void osi_property_set_bool(const char* key, bool value);
+
+constexpr uint8_t media_ccid = 0xC0;
+constexpr auto media_context = static_cast<
+    std::underlying_type<le_audio::types::LeAudioContextType>::type>(
+    le_audio::types::LeAudioContextType::MEDIA);
 
 namespace le_audio {
 namespace internal {
@@ -130,19 +141,22 @@ static RawAddress GetTestAddress(uint8_t index) {
 }
 
 static uint8_t ase_id_last_assigned;
+static uint8_t additional_ases = 0;
 
 class MockLeAudioGroupStateMachineCallbacks
     : public LeAudioGroupStateMachine::Callbacks {
  public:
   MockLeAudioGroupStateMachineCallbacks() = default;
+  MockLeAudioGroupStateMachineCallbacks(
+      const MockLeAudioGroupStateMachineCallbacks&) = delete;
+  MockLeAudioGroupStateMachineCallbacks& operator=(
+      const MockLeAudioGroupStateMachineCallbacks&) = delete;
+
   ~MockLeAudioGroupStateMachineCallbacks() override = default;
   MOCK_METHOD((void), StatusReportCb,
               (int group_id, bluetooth::le_audio::GroupStreamStatus status),
               (override));
   MOCK_METHOD((void), OnStateTransitionTimeout, (int group_id), (override));
-
- private:
-  DISALLOW_COPY_AND_ASSIGN(MockLeAudioGroupStateMachineCallbacks);
 };
 
 class StateMachineTest : public Test {
@@ -155,7 +169,11 @@ class StateMachineTest : public Test {
     gatt::SetMockBtaGattQueue(&gatt_queue);
 
     ase_id_last_assigned = types::ase::kAseIdInvalid;
+    additional_ases = 0;
+    ::le_audio::AudioSetConfigurationProvider::Initialize();
     LeAudioGroupStateMachine::Initialize(&mock_callbacks_);
+
+    ContentControlIdKeeper::GetInstance()->Start();
 
     // Support 2M Phy
     ON_CALL(mock_controller_, SupportsBle2mPhy()).WillByDefault(Return(true));
@@ -168,7 +186,7 @@ class StateMachineTest : public Test {
                          : ((uint16_t)(remote_bda.address[0] ^
                                        remote_bda.address[1] ^
                                        remote_bda.address[2]))
-                                   << 8 ||
+                                   << 8 |
                                (remote_bda.address[3] ^ remote_bda.address[4] ^
                                 remote_bda.address[5]);
             }));
@@ -190,6 +208,7 @@ class StateMachineTest : public Test {
         }));
 
     ConfigureIsoManagerMock();
+    ConfigCodecManagerMock();
   }
 
   void HandleCtpOperation(LeAudioDevice* device, std::vector<uint8_t> value,
@@ -230,13 +249,19 @@ class StateMachineTest : public Test {
                 for (auto i = 0u; i < p.cis_cfgs.size(); ++i) {
                   conn_handles.push_back(UNIQUE_CIS_CONN_HANDLE(cig_id, i));
                 }
+                auto status = HCI_SUCCESS;
+                if (group_create_command_disallowed_) {
+                  group_create_command_disallowed_ = false;
+                  status = HCI_ERR_COMMAND_DISALLOWED;
+                }
+
                 LeAudioGroupStateMachine::Get()->ProcessHciNotifOnCigCreate(
-                    group.get(), 0, cig_id, conn_handles);
+                    group.get(), status, cig_id, conn_handles);
               }
             });
 
     ON_CALL(*mock_iso_manager_, RemoveCig)
-        .WillByDefault([this](uint8_t cig_id) {
+        .WillByDefault([this](uint8_t cig_id, bool force) {
           DLOG(INFO) << "CreateRemove";
 
           auto& group = le_audio_device_groups_[cig_id];
@@ -363,6 +388,12 @@ class StateMachineTest : public Test {
             return;
           }
 
+          // When we disconnect the remote with HCI_ERR_PEER_USER, we
+          // should be getting HCI_ERR_CONN_CAUSE_LOCAL_HOST from HCI.
+          if (reason == HCI_ERR_PEER_USER) {
+            reason = HCI_ERR_CONN_CAUSE_LOCAL_HOST;
+          }
+
           for (auto& kv_pair : le_audio_device_groups_) {
             auto& group = kv_pair.second;
             if (group->IsDeviceInTheGroup(dev_it->get())) {
@@ -379,9 +410,23 @@ class StateMachineTest : public Test {
         });
   }
 
+  void ConfigCodecManagerMock() {
+    codec_manager_ = le_audio::CodecManager::GetInstance();
+    ASSERT_NE(codec_manager_, nullptr);
+    std::vector<bluetooth::le_audio::btle_audio_codec_config_t>
+        mock_offloading_preference(0);
+    codec_manager_->Start(mock_offloading_preference);
+    mock_codec_manager_ = MockCodecManager::GetInstance();
+    ASSERT_NE(mock_codec_manager_, nullptr);
+    ON_CALL(*mock_codec_manager_, GetCodecLocation())
+        .WillByDefault(Return(types::CodecLocation::HOST));
+  }
+
   void TearDown() override {
     iso_manager_->Stop();
     mock_iso_manager_ = nullptr;
+    codec_manager_->Stop();
+    mock_codec_manager_ = nullptr;
 
     gatt::SetMockBtaGattQueue(nullptr);
     gatt::SetMockBtaGattInterface(nullptr);
@@ -393,7 +438,9 @@ class StateMachineTest : public Test {
 
     le_audio_devices_.clear();
     cached_codec_configuration_map_.clear();
+    cached_ase_to_cis_id_map_.clear();
     LeAudioGroupStateMachine::Cleanup();
+    ::le_audio::AudioSetConfigurationProvider::Cleanup();
   }
 
   std::shared_ptr<LeAudioDevice> PrepareConnectedDevice(uint8_t id,
@@ -618,6 +665,7 @@ class StateMachineTest : public Test {
 
   void MultipleTestDevicePrepare(int leaudio_group_id, uint16_t context_type,
                                  uint16_t device_cnt,
+                                 uint16_t update_context_type,
                                  bool insert_default_pac_records = true) {
     // Prepare fake connected device group
     bool first_connections = true;
@@ -628,17 +676,17 @@ class StateMachineTest : public Test {
     uint8_t num_ase_src;
     switch (context_type) {
       case kContextTypeRingtone:
-        num_ase_snk = 1;
+        num_ase_snk = 1 + additional_ases;
         num_ase_src = 0;
         break;
 
       case kContextTypeMedia:
-        num_ase_snk = 2;
+        num_ase_snk = 2 + additional_ases;
         num_ase_src = 0;
         break;
 
       case kContextTypeConversational:
-        num_ase_snk = 1;
+        num_ase_snk = 1 + additional_ases;
         num_ase_src = 1;
         break;
 
@@ -654,8 +702,10 @@ class StateMachineTest : public Test {
         uint16_t attr_handle = ATTR_HANDLE_PACS_POOL_START;
 
         /* As per spec, unspecified shall be supported */
-        types::AudioContexts snk_context_type = kContextTypeUnspecified;
-        types::AudioContexts src_context_type = kContextTypeUnspecified;
+        types::AudioContexts snk_context_type =
+            kContextTypeUnspecified | update_context_type;
+        types::AudioContexts src_context_type =
+            kContextTypeUnspecified | update_context_type;
 
         // Prepare Sink Published Audio Capability records
         if ((context_type & kContextTypeRingtone) ||
@@ -705,7 +755,8 @@ class StateMachineTest : public Test {
           src_context_type |= kContextTypeConversational;
 
           leAudioDevice->src_audio_locations_ =
-              ::le_audio::codec_spec_conf::kLeAudioLocationFrontLeft;
+              ::le_audio::codec_spec_conf::kLeAudioLocationFrontLeft |
+              ::le_audio::codec_spec_conf::kLeAudioLocationFrontRight;
         }
 
         leAudioDevice->SetSupportedContexts(snk_context_type, src_context_type);
@@ -716,17 +767,20 @@ class StateMachineTest : public Test {
     }
 
     /* Stimulate update of active context map */
-    types::AudioContexts type_set = static_cast<uint16_t>(context_type);
+    types::AudioContexts type_set = static_cast<uint16_t>(
+        update_context_type == 0 ? context_type
+                                 : context_type | update_context_type);
     group->UpdateActiveContextsMap(type_set);
 
     ASSERT_NE(group, nullptr);
     ASSERT_EQ(group->Size(), total_devices);
   }
 
-  LeAudioDeviceGroup* PrepareSingleTestDeviceGroup(int leaudio_group_id,
-                                                   uint16_t context_type,
-                                                   uint16_t device_cnt = 1) {
-    MultipleTestDevicePrepare(leaudio_group_id, context_type, device_cnt);
+  LeAudioDeviceGroup* PrepareSingleTestDeviceGroup(
+      int leaudio_group_id, uint16_t context_type, uint16_t device_cnt = 1,
+      uint16_t update_context_type = 0) {
+    MultipleTestDevicePrepare(leaudio_group_id, context_type, device_cnt,
+                              update_context_type);
     return le_audio_device_groups_.count(leaudio_group_id)
                ? le_audio_device_groups_[leaudio_group_id].get()
                : nullptr;
@@ -801,11 +855,12 @@ class StateMachineTest : public Test {
   }
 
   void PrepareConfigureQosHandler(LeAudioDeviceGroup* group,
-                                  int verify_ase_count = 0) {
+                                  int verify_ase_count = 0,
+                                  bool caching = false) {
     ase_ctp_handlers[ascs::kAseCtpOpcodeConfigureQos] =
-        [group, verify_ase_count](LeAudioDevice* device,
-                                  std::vector<uint8_t> value,
-                                  GATT_WRITE_OP_CB cb, void* cb_data) {
+        [group, verify_ase_count, caching, this](
+            LeAudioDevice* device, std::vector<uint8_t> value,
+            GATT_WRITE_OP_CB cb, void* cb_data) {
           auto num_ase = value[1];
 
           // Verify ase count if needed
@@ -847,6 +902,24 @@ class StateMachineTest : public Test {
                 (uint16_t)((ase_p[0] << 16) | (ase_p[1] << 8) | ase_p[2]);
             ase_p += 3;
 
+            if (caching) {
+              LOG(INFO) << __func__ << " Device: " << device->address_;
+              if (cached_ase_to_cis_id_map_.count(device->address_) > 0) {
+                auto ase_list = cached_ase_to_cis_id_map_.at(device->address_);
+                if (ase_list.count(ase_id) > 0) {
+                  auto cis_id = ase_list.at(ase_id);
+                  ASSERT_EQ(cis_id, qos_configured_state_params.cis_id);
+                } else {
+                  ase_list[ase_id] = qos_configured_state_params.cis_id;
+                }
+              } else {
+                std::map<int, int> ase_map;
+                ase_map[ase_id] = qos_configured_state_params.cis_id;
+
+                cached_ase_to_cis_id_map_[device->address_] = ase_map;
+              }
+            }
+
             InjectAseStateNotification(ase, device, group,
                                        ascs::kAseStateQoSConfigured,
                                        &qos_configured_state_params);
@@ -878,7 +951,7 @@ class StateMachineTest : public Test {
 
             auto meta_len = *ase_p++;
             auto num_handled_bytes = ase_p - value.data();
-            ase_p += num_handled_bytes;
+            ase_p += meta_len;
 
             client_parser::ascs::ase_transient_state_params enable_params = {
                 .metadata = std::vector<uint8_t>(
@@ -1059,13 +1132,15 @@ class StateMachineTest : public Test {
         };
   }
 
-  controller::MockControllerInterface mock_controller_;
-  bluetooth::manager::MockBtmInterface btm_interface;
+  NiceMock<controller::MockControllerInterface> mock_controller_;
+  NiceMock<bluetooth::manager::MockBtmInterface> btm_interface;
   gatt::MockBtaGattInterface gatt_interface;
   gatt::MockBtaGattQueue gatt_queue;
 
   bluetooth::hci::IsoManager* iso_manager_;
   MockIsoManager* mock_iso_manager_;
+  le_audio::CodecManager* codec_manager_;
+  MockCodecManager* mock_codec_manager_;
 
   std::function<void(LeAudioDevice* device, std::vector<uint8_t> value,
                      GATT_WRITE_OP_CB cb, void* cb_data)>
@@ -1073,10 +1148,13 @@ class StateMachineTest : public Test {
   std::map<int, client_parser::ascs::ase_codec_configured_state_params>
       cached_codec_configuration_map_;
 
+  std::map<RawAddress, std::map<int, int>> cached_ase_to_cis_id_map_;
+
   MockLeAudioGroupStateMachineCallbacks mock_callbacks_;
   std::vector<std::shared_ptr<LeAudioDevice>> le_audio_devices_;
   std::map<uint8_t, std::unique_ptr<LeAudioDeviceGroup>>
       le_audio_device_groups_;
+  bool group_create_command_disallowed_ = false;
 };
 
 TEST_F(StateMachineTest, testInit) {
@@ -1102,16 +1180,23 @@ TEST_F(StateMachineTest, testConfigureCodecSingle) {
   auto* leAudioDevice = group->GetFirstDevice();
   PrepareConfigureCodecHandler(group, 1);
 
-  // Start the configuration and stream Media content
+  /* Start the configuration and stream Media content.
+   * Expect 1 time for the Codec Config call only. */
   EXPECT_CALL(gatt_queue,
               WriteCharacteristic(1, leAudioDevice->ctp_hdls_.val_hdl, _,
                                   GATT_WRITE_NO_RSP, _, _))
-      .Times(2);
+      .Times(1);
+
+  /* Do nothing on the CigCreate, so the state machine stays in the configure
+   * state */
+  ON_CALL(*mock_iso_manager_, CreateCig).WillByDefault(Return());
+  EXPECT_CALL(*mock_iso_manager_, CreateCig).Times(1);
 
   InjectInitialIdleNotification(group);
 
   ASSERT_TRUE(LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type)));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type));
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
@@ -1145,9 +1230,15 @@ TEST_F(StateMachineTest, testConfigureCodecMulti) {
 
   InjectInitialIdleNotification(group);
 
+  /* Do nothing on the CigCreate, so the state machine stays in the configure
+   * state */
+  ON_CALL(*mock_iso_manager_, CreateCig).WillByDefault(Return());
+  EXPECT_CALL(*mock_iso_manager_, CreateCig).Times(1);
+
   // Start the configuration and stream the content
   ASSERT_TRUE(LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type)));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type));
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
@@ -1179,12 +1270,54 @@ TEST_F(StateMachineTest, testConfigureQosSingle) {
   EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(0);
   EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(0);
   EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(0);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(0);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(0);
 
   InjectInitialIdleNotification(group);
 
   ASSERT_TRUE(LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type)));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type));
+
+  // Check if group has transitioned to a proper state
+  ASSERT_EQ(group->GetState(),
+            types::AseState::BTA_LE_AUDIO_ASE_STATE_QOS_CONFIGURED);
+}
+
+TEST_F(StateMachineTest, testConfigureQosSingleRecoverCig) {
+  const auto context_type = kContextTypeRingtone;
+  const int leaudio_group_id = 3;
+
+  /* Assume that on previous BT OFF CIG was not removed */
+  group_create_command_disallowed_ = true;
+
+  // Prepare fake connected device group
+  auto* group = PrepareSingleTestDeviceGroup(leaudio_group_id, context_type);
+
+  /* Since we prepared device with Ringtone context in mind, only one ASE
+   * should have been configured.
+   */
+  auto* leAudioDevice = group->GetFirstDevice();
+  PrepareConfigureCodecHandler(group, 1);
+  PrepareConfigureQosHandler(group, 1);
+
+  // Start the configuration and stream Media content
+  EXPECT_CALL(gatt_queue,
+              WriteCharacteristic(1, leAudioDevice->ctp_hdls_.val_hdl, _,
+                                  GATT_WRITE_NO_RSP, _, _))
+      .Times(3);
+
+  EXPECT_CALL(*mock_iso_manager_, CreateCig(_, _)).Times(2);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(1);
+  EXPECT_CALL(*mock_iso_manager_, EstablishCis(_)).Times(0);
+  EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(0);
+  EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(0);
+  EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(0);
+
+  InjectInitialIdleNotification(group);
+
+  ASSERT_TRUE(LeAudioGroupStateMachine::Get()->StartStream(
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type));
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
@@ -1222,13 +1355,14 @@ TEST_F(StateMachineTest, testConfigureQosMultiple) {
   EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(0);
   EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(0);
   EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(0);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(0);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(0);
 
   InjectInitialIdleNotification(group);
 
   // Start the configuration and stream Media content
   ASSERT_TRUE(LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type)));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type));
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
@@ -1260,7 +1394,7 @@ TEST_F(StateMachineTest, testStreamSingle) {
   EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(1);
   EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(0);
   EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(0);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(0);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(0);
 
   InjectInitialIdleNotification(group);
 
@@ -1272,7 +1406,8 @@ TEST_F(StateMachineTest, testStreamSingle) {
 
   // Start the configuration and stream Media content
   ASSERT_TRUE(LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type)));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type));
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
@@ -1304,7 +1439,7 @@ TEST_F(StateMachineTest, testStreamSkipEnablingSink) {
   EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(1);
   EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(0);
   EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(0);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(0);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(0);
 
   InjectInitialIdleNotification(group);
 
@@ -1316,7 +1451,8 @@ TEST_F(StateMachineTest, testStreamSkipEnablingSink) {
 
   // Start the configuration and stream Media content
   ASSERT_TRUE(LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type)));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type));
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
@@ -1349,7 +1485,7 @@ TEST_F(StateMachineTest, testStreamSkipEnablingSinkSource) {
   EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(2);
   EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(0);
   EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(0);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(0);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(0);
 
   InjectInitialIdleNotification(group);
 
@@ -1361,7 +1497,8 @@ TEST_F(StateMachineTest, testStreamSkipEnablingSinkSource) {
 
   // Start the configuration and stream Media content
   ASSERT_TRUE(LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type)));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type));
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
@@ -1381,14 +1518,14 @@ TEST_F(StateMachineTest, testStreamMultipleConversational) {
   PrepareConfigureCodecHandler(group);
   PrepareConfigureQosHandler(group);
   PrepareEnableHandler(group);
-  PrepareReceiverStartReady(group, 1);
+  PrepareReceiverStartReady(group);
 
   EXPECT_CALL(*mock_iso_manager_, CreateCig(_, _)).Times(1);
   EXPECT_CALL(*mock_iso_manager_, EstablishCis(_)).Times(AtLeast(1));
-  EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(3);
+  EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(4);
   EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(0);
   EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(0);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(0);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(0);
 
   InjectInitialIdleNotification(group);
 
@@ -1399,7 +1536,7 @@ TEST_F(StateMachineTest, testStreamMultipleConversational) {
                 WriteCharacteristic(leAudioDevice->conn_id_,
                                     leAudioDevice->ctp_hdls_.val_hdl, _,
                                     GATT_WRITE_NO_RSP, _, _))
-        .Times(AtLeast(3));
+        .Times(4);
     expected_devices_written++;
     leAudioDevice = group->GetNextDevice(leAudioDevice);
   }
@@ -1413,7 +1550,8 @@ TEST_F(StateMachineTest, testStreamMultipleConversational) {
 
   // Start the configuration and stream Media content
   ASSERT_TRUE(LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type)));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type));
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
@@ -1439,7 +1577,7 @@ TEST_F(StateMachineTest, testStreamMultiple) {
   EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(2);
   EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(0);
   EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(0);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(0);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(0);
 
   InjectInitialIdleNotification(group);
 
@@ -1464,7 +1602,8 @@ TEST_F(StateMachineTest, testStreamMultiple) {
 
   // Start the configuration and stream Media content
   ASSERT_TRUE(LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type)));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type));
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
@@ -1495,21 +1634,30 @@ TEST_F(StateMachineTest, testDisableSingle) {
   EXPECT_CALL(*mock_iso_manager_, CreateCig(_, _)).Times(1);
   EXPECT_CALL(*mock_iso_manager_, EstablishCis(_)).Times(1);
   EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(1);
-  EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(1);
+  EXPECT_CALL(
+      *mock_iso_manager_,
+      RemoveIsoDataPath(
+          _, bluetooth::hci::iso_manager::kRemoveIsoDataPathDirectionInput))
+      .Times(1);
   EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(1);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(0);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(0);
 
   InjectInitialIdleNotification(group);
 
   // Start the configuration and stream Media content
   LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type);
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
             types::AseState::BTA_LE_AUDIO_ASE_STATE_STREAMING);
 
   // Validate GroupStreamStatus
+  EXPECT_CALL(
+      mock_callbacks_,
+      StatusReportCb(leaudio_group_id,
+                     bluetooth::le_audio::GroupStreamStatus::SUSPENDING));
   EXPECT_CALL(
       mock_callbacks_,
       StatusReportCb(leaudio_group_id,
@@ -1554,21 +1702,30 @@ TEST_F(StateMachineTest, testDisableMultiple) {
   EXPECT_CALL(*mock_iso_manager_, CreateCig(_, _)).Times(1);
   EXPECT_CALL(*mock_iso_manager_, EstablishCis(_)).Times(1);
   EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(2);
-  EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(2);
+  EXPECT_CALL(
+      *mock_iso_manager_,
+      RemoveIsoDataPath(
+          _, bluetooth::hci::iso_manager::kRemoveIsoDataPathDirectionInput))
+      .Times(2);
   EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(2);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(0);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(0);
 
   InjectInitialIdleNotification(group);
 
   // Start the configuration and stream Media content
   LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type);
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
             types::AseState::BTA_LE_AUDIO_ASE_STATE_STREAMING);
 
   // Validate GroupStreamStatus
+  EXPECT_CALL(
+      mock_callbacks_,
+      StatusReportCb(leaudio_group_id,
+                     bluetooth::le_audio::GroupStreamStatus::SUSPENDING));
   EXPECT_CALL(
       mock_callbacks_,
       StatusReportCb(leaudio_group_id,
@@ -1608,13 +1765,20 @@ TEST_F(StateMachineTest, testDisableBidirectional) {
   EXPECT_CALL(*mock_iso_manager_, CreateCig(_, _)).Times(1);
   EXPECT_CALL(*mock_iso_manager_, EstablishCis(_)).Times(1);
   EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(2);
-  EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(1);
+  EXPECT_CALL(
+      *mock_iso_manager_,
+      RemoveIsoDataPath(
+          _,
+          bluetooth::hci::iso_manager::kRemoveIsoDataPathDirectionInput |
+              bluetooth::hci::iso_manager::kRemoveIsoDataPathDirectionOutput))
+      .Times(1);
   EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(1);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(0);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(0);
 
   // Start the configuration and stream Media content
   LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type);
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
@@ -1655,19 +1819,24 @@ TEST_F(StateMachineTest, testReleaseSingle) {
   EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(1);
   EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(1);
   EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(1);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(1);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(1);
 
   InjectInitialIdleNotification(group);
 
   // Start the configuration and stream Media content
   LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type);
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
             types::AseState::BTA_LE_AUDIO_ASE_STATE_STREAMING);
 
   // Validate GroupStreamStatus
+  EXPECT_CALL(
+      mock_callbacks_,
+      StatusReportCb(leaudio_group_id,
+                     bluetooth::le_audio::GroupStreamStatus::RELEASING));
   EXPECT_CALL(mock_callbacks_,
               StatusReportCb(leaudio_group_id,
                              bluetooth::le_audio::GroupStreamStatus::IDLE));
@@ -1706,14 +1875,21 @@ TEST_F(StateMachineTest, testReleaseCachingSingle) {
   EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(1);
   EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(1);
   EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(1);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(1);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(1);
 
   InjectInitialIdleNotification(group);
 
   // Validate GroupStreamStatus
-  EXPECT_CALL(mock_callbacks_,
-              StatusReportCb(leaudio_group_id,
-                             bluetooth::le_audio::GroupStreamStatus::IDLE));
+  EXPECT_CALL(
+      mock_callbacks_,
+      StatusReportCb(leaudio_group_id,
+                     bluetooth::le_audio::GroupStreamStatus::RELEASING));
+
+  EXPECT_CALL(
+      mock_callbacks_,
+      StatusReportCb(
+          leaudio_group_id,
+          bluetooth::le_audio::GroupStreamStatus::CONFIGURED_AUTONOMOUS));
   EXPECT_CALL(
       mock_callbacks_,
       StatusReportCb(leaudio_group_id,
@@ -1721,7 +1897,8 @@ TEST_F(StateMachineTest, testReleaseCachingSingle) {
 
   // Start the configuration and stream Media content
   LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type);
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
@@ -1739,46 +1916,63 @@ TEST_F(StateMachineTest, testStreamCachingSingle) {
   const auto context_type = kContextTypeRingtone;
   const int leaudio_group_id = 4;
 
+  additional_ases = 2;
   // Prepare fake connected device group
   auto* group = PrepareSingleTestDeviceGroup(leaudio_group_id, context_type);
 
   /* Since we prepared device with Ringtone context in mind, only one ASE
    * should have been configured.
    */
-  PrepareConfigureCodecHandler(group, 1, true);
-  PrepareConfigureQosHandler(group, 1);
-  PrepareEnableHandler(group, 1);
-  PrepareDisableHandler(group, 1);
-  PrepareReleaseHandler(group, 1);
+  PrepareConfigureCodecHandler(group, 2, true);
+  PrepareConfigureQosHandler(group, 2, true);
+  PrepareEnableHandler(group, 2);
+  PrepareDisableHandler(group, 2);
+  PrepareReleaseHandler(group, 2);
 
+  /* Ctp messages we expect:
+   * 1. Codec Config
+   * 2. QoS Config
+   * 3. Enable
+   * 4. Release
+   * 5. QoS Config (because device stays in Configured state)
+   * 6. Enable
+   */
   auto* leAudioDevice = group->GetFirstDevice();
   EXPECT_CALL(gatt_queue,
               WriteCharacteristic(1, leAudioDevice->ctp_hdls_.val_hdl, _,
                                   GATT_WRITE_NO_RSP, _, _))
-      .Times(4 + 3);
+      .Times(6);
 
   EXPECT_CALL(*mock_iso_manager_, CreateCig(_, _)).Times(2);
   EXPECT_CALL(*mock_iso_manager_, EstablishCis(_)).Times(2);
-  EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(2);
-  EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(1);
-  EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(1);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(1);
+  EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(4);
+  EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(2);
+  EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(2);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(1);
 
   InjectInitialIdleNotification(group);
 
   // Validate GroupStreamStatus
-  EXPECT_CALL(mock_callbacks_,
-              StatusReportCb(leaudio_group_id,
-                             bluetooth::le_audio::GroupStreamStatus::IDLE));
+  EXPECT_CALL(
+      mock_callbacks_,
+      StatusReportCb(leaudio_group_id,
+                     bluetooth::le_audio::GroupStreamStatus::RELEASING));
+
+  EXPECT_CALL(
+      mock_callbacks_,
+      StatusReportCb(
+          leaudio_group_id,
+          bluetooth::le_audio::GroupStreamStatus::CONFIGURED_AUTONOMOUS));
 
   EXPECT_CALL(mock_callbacks_,
               StatusReportCb(leaudio_group_id,
                              bluetooth::le_audio::GroupStreamStatus::STREAMING))
       .Times(2);
 
-  // Start the configuration and stream Media content
+  // Start the configuration and stream Ringtone content
   LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type);
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
@@ -1793,7 +1987,96 @@ TEST_F(StateMachineTest, testStreamCachingSingle) {
 
   // Start the configuration and stream Media content
   LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type);
+
+  // Check if group has transitioned to a proper state
+  ASSERT_EQ(group->GetState(),
+            types::AseState::BTA_LE_AUDIO_ASE_STATE_STREAMING);
+}
+
+TEST_F(StateMachineTest, testActivateStreamCachingSingle) {
+  auto context_type = kContextTypeConversational;
+  const int leaudio_group_id = 4;
+
+  additional_ases = 2;
+  /* Prepare fake connected device group with update of Media and Conversational
+   * contexts
+   */
+  auto* group = PrepareSingleTestDeviceGroup(
+      leaudio_group_id, context_type, 1,
+      kContextTypeConversational | kContextTypeMedia);
+
+  /* Since we prepared device with Conversational context in mind, only one ASE
+   * should have been configured.
+   */
+  PrepareConfigureCodecHandler(group, 0, true);
+  PrepareConfigureQosHandler(group, 0, true);
+  PrepareEnableHandler(group);
+  PrepareReceiverStartReady(group);
+  PrepareReleaseHandler(group);
+
+  /* Ctp messages we expect:
+   * 1. Codec Config
+   * 2. QoS Config
+   * 3. Enable
+   * 4. Release
+   * 5. QoS Config (because device stays in Configured state)
+   * 6. Enable
+   */
+  auto* leAudioDevice = group->GetFirstDevice();
+  EXPECT_CALL(gatt_queue,
+              WriteCharacteristic(1, leAudioDevice->ctp_hdls_.val_hdl, _,
+                                  GATT_WRITE_NO_RSP, _, _))
+      .Times(8);
+
+  EXPECT_CALL(*mock_iso_manager_, CreateCig(_, _)).Times(2);
+  EXPECT_CALL(*mock_iso_manager_, EstablishCis(_)).Times(2);
+  EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(5);
+  EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(2);
+  EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(2);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(1);
+
+  InjectInitialIdleNotification(group);
+
+  // Validate GroupStreamStatus
+  EXPECT_CALL(
+      mock_callbacks_,
+      StatusReportCb(leaudio_group_id,
+                     bluetooth::le_audio::GroupStreamStatus::RELEASING));
+
+  EXPECT_CALL(
+      mock_callbacks_,
+      StatusReportCb(
+          leaudio_group_id,
+          bluetooth::le_audio::GroupStreamStatus::CONFIGURED_AUTONOMOUS));
+
+  EXPECT_CALL(mock_callbacks_,
+              StatusReportCb(leaudio_group_id,
+                             bluetooth::le_audio::GroupStreamStatus::STREAMING))
+      .Times(2);
+
+  // Start the configuration and stream Conversational content
+  LeAudioGroupStateMachine::Get()->StartStream(
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type);
+
+  // Check if group has transitioned to a proper state
+  ASSERT_EQ(group->GetState(),
+            types::AseState::BTA_LE_AUDIO_ASE_STATE_STREAMING);
+
+  // Stop the stream
+  LeAudioGroupStateMachine::Get()->StopStream(group);
+
+  // Check if group has transitioned to a proper state
+  ASSERT_EQ(group->GetState(),
+            types::AseState::BTA_LE_AUDIO_ASE_STATE_CODEC_CONFIGURED);
+
+  // Start the configuration and stream Media content
+  context_type = kContextTypeMedia;
+  LeAudioGroupStateMachine::Get()->StartStream(
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type);
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
@@ -1834,19 +2117,24 @@ TEST_F(StateMachineTest, testReleaseMultiple) {
   EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(2);
   EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(2);
   EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(2);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(1);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(1);
 
   InjectInitialIdleNotification(group);
 
   // Start the configuration and stream Media content
   LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      types::AudioContexts(context_type));
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
             types::AseState::BTA_LE_AUDIO_ASE_STATE_STREAMING);
 
   // Validate GroupStreamStatus
+  EXPECT_CALL(
+      mock_callbacks_,
+      StatusReportCb(leaudio_group_id,
+                     bluetooth::le_audio::GroupStreamStatus::RELEASING));
   EXPECT_CALL(mock_callbacks_,
               StatusReportCb(leaudio_group_id,
                              bluetooth::le_audio::GroupStreamStatus::IDLE));
@@ -1886,13 +2174,14 @@ TEST_F(StateMachineTest, testReleaseBidirectional) {
   EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(2);
   EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(1);
   EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(1);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(1);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(1);
 
   InjectInitialIdleNotification(group);
 
   // Start the configuration and stream Media content
   LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      types::AudioContexts(context_type));
 
   // Check if group has transitioned to a proper state
   ASSERT_EQ(group->GetState(),
@@ -1934,11 +2223,12 @@ TEST_F(StateMachineTest, testDisableAndReleaseBidirectional) {
   EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(2);
   EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(1);
   EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(1);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(1);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(1);
 
   // Start the configuration and stream Media content
   LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type);
 
   // Suspend the stream
   LeAudioGroupStateMachine::Get()->SuspendStream(group);
@@ -1967,7 +2257,7 @@ TEST_F(StateMachineTest, testAseIdAssignmentIdle) {
   EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(0);
   EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(0);
   EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(0);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(0);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(0);
 
   for (auto* device = group->GetFirstDevice(); device != nullptr;
        device = group->GetNextDevice(device)) {
@@ -1997,7 +2287,7 @@ TEST_F(StateMachineTest, testAseIdAssignmentCodecConfigured) {
   EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(0);
   EXPECT_CALL(*mock_iso_manager_, RemoveIsoDataPath(_, _)).Times(0);
   EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(0);
-  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_)).Times(0);
+  EXPECT_CALL(*mock_iso_manager_, RemoveCig(_, _)).Times(0);
 
   for (auto* device = group->GetFirstDevice(); device != nullptr;
        device = group->GetNextDevice(device)) {
@@ -2042,12 +2332,17 @@ TEST_F(StateMachineTest, testAseAutonomousRelease) {
 
   // Start the configuration and stream Media content
   ASSERT_TRUE(LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type)));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type));
 
   // Validate new GroupStreamStatus
   EXPECT_CALL(mock_callbacks_,
               StatusReportCb(leaudio_group_id,
-                             bluetooth::le_audio::GroupStreamStatus::IDLE));
+                             bluetooth::le_audio::GroupStreamStatus::IDLE))
+      .Times(AtLeast(1));
+
+  /* Single disconnect as it is bidirectional Cis*/
+  EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(1);
 
   for (auto* device = group->GetFirstDevice(); device != nullptr;
        device = group->GetNextDevice(device)) {
@@ -2074,6 +2369,89 @@ TEST_F(StateMachineTest, testAseAutonomousRelease) {
   }
 }
 
+TEST_F(StateMachineTest, testAseAutonomousRelease2Devices) {
+  const auto context_type = kContextTypeConversational;
+  const int leaudio_group_id = 4;
+  const int num_of_devices = 2;
+
+  // Prepare fake connected device group
+  auto* group = PrepareSingleTestDeviceGroup(leaudio_group_id, context_type,
+                                             num_of_devices);
+
+  /* Since we prepared device with Conversional context in mind, Sink and Source
+   * ASEs should have been configured.
+   */
+  PrepareConfigureCodecHandler(group);
+  PrepareConfigureQosHandler(group);
+  PrepareEnableHandler(group);
+  PrepareDisableHandler(group);
+  PrepareReceiverStartReady(group);
+  PrepareReceiverStopReady(group);
+  PrepareReleaseHandler(group);
+
+  InjectInitialIdleNotification(group);
+
+  // Validate initial GroupStreamStatus
+  EXPECT_CALL(
+      mock_callbacks_,
+      StatusReportCb(leaudio_group_id,
+                     bluetooth::le_audio::GroupStreamStatus::STREAMING));
+
+  // Start the configuration and stream Media content
+  ASSERT_TRUE(LeAudioGroupStateMachine::Get()->StartStream(
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type));
+
+  // Check streaming will continue
+  EXPECT_CALL(mock_callbacks_,
+              StatusReportCb(leaudio_group_id,
+                             bluetooth::le_audio::GroupStreamStatus::IDLE))
+      .Times(0);
+
+  /* Single disconnect as it is bidirectional Cis*/
+  EXPECT_CALL(*mock_iso_manager_, DisconnectCis(_, _)).Times(1);
+
+  auto device = group->GetFirstDevice();
+  for (auto& ase : device->ases_) {
+    client_parser::ascs::ase_codec_configured_state_params
+        codec_configured_state_params;
+
+    ASSERT_EQ(ase.state, types::AseState::BTA_LE_AUDIO_ASE_STATE_STREAMING);
+
+    // Simulate autonomus release for one device.
+    InjectAseStateNotification(&ase, device, group, ascs::kAseStateReleasing,
+                               &codec_configured_state_params);
+    InjectAseStateNotification(&ase, device, group, ascs::kAseStateIdle,
+                               &codec_configured_state_params);
+  }
+}
+
+TEST_F(StateMachineTest, testStateTransitionTimeoutOnIdleState) {
+  const auto context_type = kContextTypeRingtone;
+  const int leaudio_group_id = 4;
+
+  // Prepare fake connected device group
+  auto* group = PrepareSingleTestDeviceGroup(leaudio_group_id, context_type);
+
+  auto* leAudioDevice = group->GetFirstDevice();
+  EXPECT_CALL(gatt_queue,
+              WriteCharacteristic(1, leAudioDevice->ctp_hdls_.val_hdl, _,
+                                  GATT_WRITE_NO_RSP, _, _))
+      .Times(1);
+
+  // Start the configuration and stream Media content
+  ASSERT_TRUE(LeAudioGroupStateMachine::Get()->StartStream(
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type));
+
+  // Disconnect device
+  LeAudioGroupStateMachine::Get()->ProcessHciNotifAclDisconnected(
+      group, leAudioDevice);
+
+  // Make sure timeout is cleared
+  ASSERT_TRUE(fake_osi_alarm_set_on_mloop_.cb == nullptr);
+}
+
 TEST_F(StateMachineTest, testStateTransitionTimeout) {
   const auto context_type = kContextTypeRingtone;
   const int leaudio_group_id = 4;
@@ -2095,7 +2473,8 @@ TEST_F(StateMachineTest, testStateTransitionTimeout) {
 
   // Start the configuration and stream Media content
   ASSERT_TRUE(LeAudioGroupStateMachine::Get()->StartStream(
-      group, static_cast<types::LeAudioContextType>(context_type)));
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type));
 
   // Check if timeout is fired
   EXPECT_CALL(mock_callbacks_, OnStateTransitionTimeout(leaudio_group_id));
@@ -2104,5 +2483,297 @@ TEST_F(StateMachineTest, testStateTransitionTimeout) {
   fake_osi_alarm_set_on_mloop_.cb(fake_osi_alarm_set_on_mloop_.data);
   ASSERT_EQ(1, mock_function_count_map["alarm_set_on_mloop"]);
 }
+
+MATCHER_P(dataPathIsEq, expected, "") { return (arg.data_path_id == expected); }
+
+TEST_F(StateMachineTest, testConfigureDataPathForHost) {
+  const auto context_type = kContextTypeRingtone;
+  const int leaudio_group_id = 4;
+
+  /* Should be called 3 times because
+   * 1 - calling GetConfigurations just after connection
+   * (UpdateActiveContextsMap)
+   * 2 - when doing configuration of the context type
+   * 3 - AddCisToStreamConfiguration -> CreateStreamVectorForOffloader
+   * 4 - Data Path
+   */
+  EXPECT_CALL(*mock_codec_manager_, GetCodecLocation())
+      .Times(4)
+      .WillRepeatedly(Return(types::CodecLocation::HOST));
+
+  // Prepare fake connected device group
+  auto* group = PrepareSingleTestDeviceGroup(leaudio_group_id, context_type);
+
+  /* Since we prepared device with Ringtone context in mind, only one ASE
+   * should have been configured.
+   */
+  PrepareConfigureCodecHandler(group, 1);
+  PrepareConfigureQosHandler(group, 1);
+  PrepareEnableHandler(group, 1);
+
+  EXPECT_CALL(
+      *mock_iso_manager_,
+      SetupIsoDataPath(
+          _, dataPathIsEq(bluetooth::hci::iso_manager::kIsoDataPathHci)))
+      .Times(1);
+
+  InjectInitialIdleNotification(group);
+
+  // Start the configuration and stream Media content
+  ASSERT_TRUE(LeAudioGroupStateMachine::Get()->StartStream(
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type));
+}
+TEST_F(StateMachineTest, testConfigureDataPathForAdsp) {
+  const auto context_type = kContextTypeRingtone;
+  const int leaudio_group_id = 4;
+
+  /* Should be called 3 times because
+   * 1 - calling GetConfigurations just after connection
+   * (UpdateActiveContextsMap)
+   * 2 - when doing configuration of the context type
+   * 3 - AddCisToStreamConfiguration -> CreateStreamVectorForOffloader
+   * 4 - data path
+   */
+  EXPECT_CALL(*mock_codec_manager_, GetCodecLocation())
+      .Times(4)
+      .WillRepeatedly(Return(types::CodecLocation::ADSP));
+
+  // Prepare fake connected device group
+  auto* group = PrepareSingleTestDeviceGroup(leaudio_group_id, context_type);
+
+  /* Since we prepared device with Ringtone context in mind, only one ASE
+   * should have been configured.
+   */
+  PrepareConfigureCodecHandler(group, 1);
+  PrepareConfigureQosHandler(group, 1);
+  PrepareEnableHandler(group, 1);
+
+  EXPECT_CALL(
+      *mock_iso_manager_,
+      SetupIsoDataPath(
+          _, dataPathIsEq(
+                 bluetooth::hci::iso_manager::kIsoDataPathPlatformDefault)))
+      .Times(1);
+
+  InjectInitialIdleNotification(group);
+
+  // Start the configuration and stream Media content
+  ASSERT_TRUE(LeAudioGroupStateMachine::Get()->StartStream(
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type));
+}
+
+static void InjectAclDisconnected(LeAudioDeviceGroup* group,
+                                  LeAudioDevice* leAudioDevice) {
+  LeAudioGroupStateMachine::Get()->ProcessHciNotifAclDisconnected(
+      group, leAudioDevice);
+}
+
+TEST_F(StateMachineTest, testStreamConfigurationAdspDownMix) {
+  const auto context_type = kContextTypeConversational;
+  const int leaudio_group_id = 4;
+  const int num_devices = 2;
+
+  // Prepare fake connected device group
+  auto* group = PrepareSingleTestDeviceGroup(
+      leaudio_group_id, context_type, num_devices, kContextTypeConversational);
+
+  /* Should be called 5 times because
+   * 1 - calling GetConfigurations just after connection
+   * (UpdateActiveContextsMap),
+   * 2 - when doing configuration of the context type
+   * 3 - AddCisToStreamConfiguration -> CreateStreamVectorForOffloader (sink)
+   * 4 - AddCisToStreamConfiguration -> CreateStreamVectorForOffloader (source)
+   * 5,6 - Data Path
+   */
+  EXPECT_CALL(*mock_codec_manager_, GetCodecLocation())
+      .Times(6)
+      .WillRepeatedly(Return(types::CodecLocation::ADSP));
+
+  PrepareConfigureCodecHandler(group);
+  PrepareConfigureQosHandler(group);
+  PrepareEnableHandler(group);
+  PrepareReceiverStartReady(group);
+
+  InjectInitialIdleNotification(group);
+
+  auto* leAudioDevice = group->GetFirstDevice();
+  InjectAclDisconnected(group, leAudioDevice);
+
+  // Start the configuration and stream Media content
+  ASSERT_TRUE(LeAudioGroupStateMachine::Get()->StartStream(
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type));
+
+  ASSERT_EQ(
+      static_cast<int>(
+          group->stream_conf.sink_offloader_streams_target_allocation.size()),
+      2);
+  ASSERT_EQ(
+      static_cast<int>(
+          group->stream_conf.source_offloader_streams_target_allocation.size()),
+      2);
+
+  ASSERT_EQ(
+      static_cast<int>(
+          group->stream_conf.sink_offloader_streams_current_allocation.size()),
+      2);
+  ASSERT_EQ(
+      static_cast<int>(group->stream_conf
+                           .source_offloader_streams_current_allocation.size()),
+      2);
+
+  // Check if group has transitioned to a proper state
+  ASSERT_EQ(group->GetState(),
+            types::AseState::BTA_LE_AUDIO_ASE_STATE_STREAMING);
+
+  uint32_t allocation = 0;
+  for (const auto& s :
+       group->stream_conf.sink_offloader_streams_target_allocation) {
+    allocation |= s.second;
+    ASSERT_FALSE(allocation == 0);
+  }
+  ASSERT_TRUE(allocation == codec_spec_conf::kLeAudioLocationStereo);
+
+  allocation = 0;
+  for (const auto& s :
+       group->stream_conf.source_offloader_streams_target_allocation) {
+    allocation |= s.second;
+    ASSERT_FALSE(allocation == 0);
+  }
+  ASSERT_TRUE(allocation == codec_spec_conf::kLeAudioLocationStereo);
+
+  for (const auto& s :
+       group->stream_conf.sink_offloader_streams_current_allocation) {
+    ASSERT_TRUE((s.second == 0) ||
+                (s.second == codec_spec_conf::kLeAudioLocationStereo));
+  }
+
+  for (const auto& s :
+       group->stream_conf.source_offloader_streams_current_allocation) {
+    ASSERT_TRUE((s.second == 0) ||
+                (s.second == codec_spec_conf::kLeAudioLocationStereo));
+  }
+}
+
+static void InjectCisDisconnected(LeAudioDeviceGroup* group,
+                                  LeAudioDevice* leAudioDevice,
+                                  uint8_t reason) {
+  bluetooth::hci::iso_manager::cis_disconnected_evt event;
+
+  auto* ase = leAudioDevice->GetFirstActiveAse();
+  while (ase) {
+    event.reason = reason;
+    event.cig_id = group->group_id_;
+    event.cis_conn_hdl = ase->cis_conn_hdl;
+    LeAudioGroupStateMachine::Get()->ProcessHciNotifCisDisconnected(
+        group, leAudioDevice, &event);
+
+    ase = leAudioDevice->GetNextActiveAse(ase);
+  }
+}
+
+TEST_F(StateMachineTest, testAttachDeviceToTheStream) {
+  const auto context_type = kContextTypeMedia;
+  const auto leaudio_group_id = 6;
+  const auto num_devices = 2;
+
+  ContentControlIdKeeper::GetInstance()->SetCcid(media_context, media_ccid);
+
+  // Prepare multiple fake connected devices in a group
+  auto* group =
+      PrepareSingleTestDeviceGroup(leaudio_group_id, context_type, num_devices);
+  ASSERT_EQ(group->Size(), num_devices);
+
+  PrepareConfigureCodecHandler(group);
+  PrepareConfigureQosHandler(group);
+  PrepareEnableHandler(group);
+  PrepareDisableHandler(group);
+  PrepareReleaseHandler(group);
+
+  auto* leAudioDevice = group->GetFirstDevice();
+  LeAudioDevice* lastDevice;
+
+  auto expected_devices_written = 0;
+  while (leAudioDevice) {
+    /* Three Writes:
+     * 1: Codec Config
+     * 2: Codec QoS
+     * 3: Enabling
+     */
+    lastDevice = leAudioDevice;
+    EXPECT_CALL(gatt_queue,
+                WriteCharacteristic(leAudioDevice->conn_id_,
+                                    leAudioDevice->ctp_hdls_.val_hdl, _,
+                                    GATT_WRITE_NO_RSP, _, _))
+        .Times(AtLeast(3));
+    expected_devices_written++;
+    leAudioDevice = group->GetNextDevice(leAudioDevice);
+  }
+  ASSERT_EQ(expected_devices_written, num_devices);
+
+  EXPECT_CALL(*mock_iso_manager_, CreateCig(_, _)).Times(1);
+  EXPECT_CALL(*mock_iso_manager_, EstablishCis(_)).Times(1);
+  EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(2);
+
+  InjectInitialIdleNotification(group);
+
+  // Start the configuration and stream Media content
+  LeAudioGroupStateMachine::Get()->StartStream(
+      group, static_cast<types::LeAudioContextType>(context_type),
+      context_type);
+
+  // Check if group has transitioned to a proper state
+  ASSERT_EQ(group->GetState(),
+            types::AseState::BTA_LE_AUDIO_ASE_STATE_STREAMING);
+  testing::Mock::VerifyAndClearExpectations(&mock_iso_manager_);
+
+  // Inject CIS and ACL disconnection of first device
+  InjectCisDisconnected(group, lastDevice, HCI_ERR_CONNECTION_TOUT);
+  InjectAclDisconnected(group, lastDevice);
+
+  // Check if group keeps streaming
+  ASSERT_EQ(group->GetState(),
+            types::AseState::BTA_LE_AUDIO_ASE_STATE_STREAMING);
+
+  lastDevice->conn_id_ = 3;
+  group->UpdateActiveContextsMap();
+
+  // Make sure ASE with disconnected CIS are not left in STREAMING
+  ASSERT_EQ(lastDevice->GetFirstAseWithState(
+                ::le_audio::types::kLeAudioDirectionSink,
+                types::AseState::BTA_LE_AUDIO_ASE_STATE_STREAMING),
+            nullptr);
+  ASSERT_EQ(lastDevice->GetFirstAseWithState(
+                ::le_audio::types::kLeAudioDirectionSource,
+                types::AseState::BTA_LE_AUDIO_ASE_STATE_STREAMING),
+            nullptr);
+
+  EXPECT_CALL(gatt_queue, WriteCharacteristic(lastDevice->conn_id_,
+                                              lastDevice->ctp_hdls_.val_hdl, _,
+                                              GATT_WRITE_NO_RSP, _, _))
+      .Times(AtLeast(3));
+
+  EXPECT_CALL(*mock_iso_manager_, EstablishCis(_)).Times(1);
+  EXPECT_CALL(*mock_iso_manager_, SetupIsoDataPath(_, _)).Times(1);
+  LeAudioGroupStateMachine::Get()->AttachToStream(group, lastDevice);
+
+  // Check if group keeps streaming
+  ASSERT_EQ(group->GetState(),
+            types::AseState::BTA_LE_AUDIO_ASE_STATE_STREAMING);
+
+  // Verify that the joining device receives the right CCID list
+  auto lastMeta = lastDevice->GetFirstActiveAse()->metadata;
+  bool parsedOk = false;
+  auto ltv = le_audio::types::LeAudioLtvMap::Parse(lastMeta.data(),
+                                                   lastMeta.size(), parsedOk);
+  ASSERT_TRUE(parsedOk);
+
+  auto ccids = ltv.Find(le_audio::types::kLeAudioMetadataTypeCcidList);
+  ASSERT_TRUE(ccids.has_value());
+  ASSERT_NE(std::find(ccids->begin(), ccids->end(), media_ccid), ccids->end());
+}
+
 }  // namespace internal
 }  // namespace le_audio

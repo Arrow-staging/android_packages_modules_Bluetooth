@@ -31,10 +31,18 @@ extern std::map<std::string, int> mock_function_count_map;
 #define UNUSED_ATTR
 #endif
 
-BleScannerInterface* bluetooth::shim::get_ble_scanner_instance() {
+::BleScannerInterface* bluetooth::shim::get_ble_scanner_instance() {
   mock_function_count_map[__func__]++;
   return nullptr;
 }
 void bluetooth::shim::init_scanning_manager() {
+  mock_function_count_map[__func__]++;
+}
+
+void bluetooth::shim::set_ad_type_rsi_filter(bool enable) {
+  mock_function_count_map[__func__]++;
+}
+
+void bluetooth::shim::set_empty_filter(bool enable) {
   mock_function_count_map[__func__]++;
 }

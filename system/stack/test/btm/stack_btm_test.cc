@@ -25,22 +25,31 @@
 #include <vector>
 
 #include "btif/include/btif_hh.h"
+#include "common/init_flags.h"
 #include "hci/include/hci_layer.h"
 #include "hci/include/hci_packet_factory.h"
 #include "internal_include/stack_config.h"
 #include "osi/include/allocator.h"
 #include "osi/include/osi.h"
+#include "stack/btm/btm_dev.h"
 #include "stack/btm/btm_int_types.h"
 #include "stack/btm/btm_sco.h"
+#include "stack/btm/btm_sec.h"
+#include "stack/btm/security_device_record.h"
 #include "stack/include/acl_api.h"
 #include "stack/include/acl_hci_link_interface.h"
 #include "stack/include/btm_client_interface.h"
 #include "stack/include/hcidefs.h"
+#include "stack/include/sec_hci_link_interface.h"
 #include "stack/l2cap/l2c_int.h"
-#include "test/mock/mock_hcic_hcicmds.h"
+#include "test/mock/mock_osi_list.h"
+#include "test/mock/mock_stack_hcic_hcicmds.h"
 #include "types/raw_address.h"
 
-namespace mock = test::mock::hcic_hcicmds;
+using testing::Each;
+using testing::Eq;
+
+namespace mock = test::mock::stack_hcic_hcicmds;
 
 extern tBTM_CB btm_cb;
 
@@ -53,6 +62,8 @@ const hci_t* hci_layer_get_interface() { return nullptr; }
 void LogMsg(uint32_t trace_set_mask, const char* fmt_str, ...) {}
 
 const std::string kSmpOptions("mock smp options");
+const std::string kBroadcastAudioConfigOptions(
+    "mock broadcast audio config options");
 
 bool get_trace_config_enabled(void) { return false; }
 bool get_pts_avrcp_test(void) { return false; }
@@ -61,6 +72,22 @@ bool get_pts_conn_updates_disabled(void) { return false; }
 bool get_pts_crosskey_sdp_disable(void) { return false; }
 const std::string* get_pts_smp_options(void) { return &kSmpOptions; }
 int get_pts_smp_failure_case(void) { return 123; }
+bool get_pts_force_eatt_for_notifications(void) { return false; }
+bool get_pts_connect_eatt_unconditionally(void) { return false; }
+bool get_pts_connect_eatt_before_encryption(void) { return false; }
+bool get_pts_unencrypt_broadcast(void) { return false; }
+bool get_pts_eatt_peripheral_collision_support(void) { return false; }
+bool get_pts_use_eatt_for_all_services(void) { return false; }
+bool get_pts_force_le_audio_multiple_contexts_metadata(void) { return false; }
+bool get_pts_l2cap_ecoc_upper_tester(void) { return false; }
+int get_pts_l2cap_ecoc_min_key_size(void) { return -1; }
+int get_pts_l2cap_ecoc_initial_chan_cnt(void) { return -1; }
+bool get_pts_l2cap_ecoc_connect_remaining(void) { return false; }
+int get_pts_l2cap_ecoc_send_num_of_sdu(void) { return -1; }
+bool get_pts_l2cap_ecoc_reconfigure(void) { return false; }
+const std::string* get_pts_broadcast_audio_config_options(void) {
+  return &kBroadcastAudioConfigOptions;
+}
 config_t* get_all(void) { return nullptr; }
 const packet_fragmenter_t* packet_fragmenter_get_interface() { return nullptr; }
 
@@ -72,6 +99,26 @@ stack_config_t mock_stack_config{
     .get_pts_crosskey_sdp_disable = get_pts_crosskey_sdp_disable,
     .get_pts_smp_options = get_pts_smp_options,
     .get_pts_smp_failure_case = get_pts_smp_failure_case,
+    .get_pts_force_eatt_for_notifications =
+        get_pts_force_eatt_for_notifications,
+    .get_pts_connect_eatt_unconditionally =
+        get_pts_connect_eatt_unconditionally,
+    .get_pts_connect_eatt_before_encryption =
+        get_pts_connect_eatt_before_encryption,
+    .get_pts_unencrypt_broadcast = get_pts_unencrypt_broadcast,
+    .get_pts_eatt_peripheral_collision_support =
+        get_pts_eatt_peripheral_collision_support,
+    .get_pts_l2cap_ecoc_upper_tester = get_pts_l2cap_ecoc_upper_tester,
+    .get_pts_l2cap_ecoc_min_key_size = get_pts_l2cap_ecoc_min_key_size,
+    .get_pts_force_le_audio_multiple_contexts_metadata =
+        get_pts_force_le_audio_multiple_contexts_metadata,
+    .get_pts_l2cap_ecoc_initial_chan_cnt = get_pts_l2cap_ecoc_initial_chan_cnt,
+    .get_pts_l2cap_ecoc_connect_remaining =
+        get_pts_l2cap_ecoc_connect_remaining,
+    .get_pts_l2cap_ecoc_send_num_of_sdu = get_pts_l2cap_ecoc_send_num_of_sdu,
+    .get_pts_l2cap_ecoc_reconfigure = get_pts_l2cap_ecoc_reconfigure,
+    .get_pts_broadcast_audio_config_options =
+        get_pts_broadcast_audio_config_options,
     .get_all = get_all,
 };
 const stack_config_t* stack_config_get_interface(void) {
@@ -106,6 +153,13 @@ class StackBtmTest : public Test {
   void TearDown() override {}
 };
 
+class StackBtmWithInitFreeTest : public StackBtmTest {
+ public:
+ protected:
+  void SetUp() override { btm_cb.Init(BTM_SEC_MODE_SC); }
+  void TearDown() override { btm_cb.Free(); }
+};
+
 TEST_F(StackBtmTest, GlobalLifecycle) {
   get_btm_client_interface().lifecycle.btm_init();
   get_btm_client_interface().lifecycle.btm_free();
@@ -114,6 +168,18 @@ TEST_F(StackBtmTest, GlobalLifecycle) {
 TEST_F(StackBtmTest, DynamicLifecycle) {
   auto* btm = new tBTM_CB();
   delete btm;
+}
+
+TEST_F(StackBtmTest, InitFree) {
+  btm_cb.Init(0x1);
+  btm_cb.Free();
+}
+
+TEST_F(StackBtmTest, tSCO_CB) {
+  bluetooth::common::InitFlags::SetAllForTesting();
+  tSCO_CB* p_sco = &btm_cb.sco_cb;
+  p_sco->Init();
+  p_sco->Free();
 }
 
 TEST_F(StackBtmTest, InformClientOnConnectionSuccess) {
@@ -163,26 +229,30 @@ TEST_F(StackBtmTest, change_packet_type) {
   uint64_t features = 0xffffffffffffffff;
   acl_process_supported_features(0x123, features);
 
-  mock::btsnd_hcic_change_conn_type = {};
-  uint16_t pkt_types = 0x55aa;
-  btm_set_packet_types_from_address(bda, pkt_types);
-  ASSERT_EQ(++cnt, mock_function_count_map["btsnd_hcic_change_conn_type"]);
-  ASSERT_EQ(0x123, mock::btsnd_hcic_change_conn_type.handle);
-  ASSERT_EQ(Hex16(0x4400 | HCI_PKT_TYPES_MASK_DM1),
-            Hex16(mock::btsnd_hcic_change_conn_type.packet_types));
+  uint16_t handle{0};
+  uint16_t packet_types{0};
 
-  mock::btsnd_hcic_change_conn_type = {};
+  mock::btsnd_hcic_change_conn_type.body = [&handle, &packet_types](
+                                               uint16_t h, uint16_t p) {
+    handle = h;
+    packet_types = p;
+  };
+  btm_set_packet_types_from_address(bda, 0x55aa);
+  ASSERT_EQ(++cnt, mock_function_count_map["btsnd_hcic_change_conn_type"]);
+  ASSERT_EQ(0x123, handle);
+  ASSERT_EQ(Hex16(0x4400 | HCI_PKT_TYPES_MASK_DM1), Hex16(packet_types));
+
   btm_set_packet_types_from_address(bda, 0xffff);
   ASSERT_EQ(++cnt, mock_function_count_map["btsnd_hcic_change_conn_type"]);
-  ASSERT_EQ(0x123, mock::btsnd_hcic_change_conn_type.handle);
+  ASSERT_EQ(0x123, handle);
   ASSERT_EQ(Hex16(0xcc00 | HCI_PKT_TYPES_MASK_DM1 | HCI_PKT_TYPES_MASK_DH1),
-            Hex16(mock::btsnd_hcic_change_conn_type.packet_types));
+            Hex16(packet_types));
+
+  btm_set_packet_types_from_address(bda, 0x0);
+  ASSERT_EQ(0x123, handle);
+  ASSERT_EQ(Hex16(0xcc18), Hex16(packet_types));
 
   mock::btsnd_hcic_change_conn_type = {};
-  btm_set_packet_types_from_address(bda, 0x0);
-  // NOTE: The call should not be executed with no bits set
-  ASSERT_EQ(0x0, mock::btsnd_hcic_change_conn_type.handle);
-  ASSERT_EQ(Hex16(0x0), Hex16(mock::btsnd_hcic_change_conn_type.packet_types));
   get_btm_client_interface().lifecycle.btm_free();
 }
 
@@ -201,4 +271,126 @@ TEST(ScoTest, make_sco_packet) {
   osi_free(p);
 }
 
+TEST(BtmTest, BTM_EIR_MAX_SERVICES) { ASSERT_EQ(46, BTM_EIR_MAX_SERVICES); }
+
 }  // namespace
+
+void btm_sec_rmt_name_request_complete(const RawAddress* p_bd_addr,
+                                       const uint8_t* p_bd_name,
+                                       tHCI_STATUS status);
+
+struct {
+  RawAddress bd_addr;
+  DEV_CLASS dc;
+  tBTM_BD_NAME bd_name;
+} btm_test;
+
+TEST(SecTest, btm_sec_rmt_name_request_complete) {
+  bluetooth::common::InitFlags::SetAllForTesting();
+  btm_cb.Init(0);
+
+  ASSERT_TRUE(BTM_SecAddRmtNameNotifyCallback(
+      [](const RawAddress& bd_addr, DEV_CLASS dc, tBTM_BD_NAME bd_name) {
+        btm_test.bd_addr = bd_addr;
+        memcpy(btm_test.dc, dc, DEV_CLASS_LEN);
+        memcpy(btm_test.bd_name, bd_name, BTM_MAX_REM_BD_NAME_LEN);
+      }));
+
+  RawAddress bd_addr = RawAddress({0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6});
+  const uint8_t* p_bd_name = (const uint8_t*)"MyTestName";
+
+  btm_test = {};
+  btm_sec_rmt_name_request_complete(&bd_addr, p_bd_name, HCI_SUCCESS);
+
+  ASSERT_THAT(btm_test.bd_name, Each(Eq(0)));
+  ASSERT_THAT(btm_test.dc, Each(Eq(0)));
+  ASSERT_EQ(bd_addr, btm_test.bd_addr);
+
+  btm_test = {};
+  ASSERT_TRUE(btm_find_or_alloc_dev(bd_addr) != nullptr);
+  btm_sec_rmt_name_request_complete(&bd_addr, p_bd_name, HCI_SUCCESS);
+
+  ASSERT_STREQ((const char*)p_bd_name, (const char*)btm_test.bd_name);
+  ASSERT_THAT(btm_test.dc, Each(Eq(0)));
+  ASSERT_EQ(bd_addr, btm_test.bd_addr);
+
+  btm_cb.Free();
+}
+
+TEST_F(StackBtmWithInitFreeTest, btm_sec_encrypt_change) {
+  bluetooth::common::InitFlags::SetAllForTesting();
+
+  RawAddress bd_addr = RawAddress({0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6});
+  const uint16_t classic_handle = 0x1234;
+  const uint16_t ble_handle = 0x9876;
+
+  // Check the collision conditionals
+  btm_cb.collision_start_time = 0UL;
+  btm_sec_encrypt_change(classic_handle, HCI_ERR_LMP_ERR_TRANS_COLLISION, 0x01);
+  uint64_t collision_start_time = btm_cb.collision_start_time;
+  ASSERT_NE(0UL, collision_start_time);
+
+  btm_cb.collision_start_time = 0UL;
+  btm_sec_encrypt_change(classic_handle, HCI_ERR_DIFF_TRANSACTION_COLLISION,
+                         0x01);
+  collision_start_time = btm_cb.collision_start_time;
+  ASSERT_NE(0UL, collision_start_time);
+
+  // No device
+  btm_cb.collision_start_time = 0;
+  btm_sec_encrypt_change(classic_handle, HCI_SUCCESS, 0x01);
+  ASSERT_EQ(0UL, btm_cb.collision_start_time);
+
+  // Setup device
+  tBTM_SEC_DEV_REC* device_record = btm_sec_allocate_dev_rec();
+  ASSERT_NE(nullptr, device_record);
+  ASSERT_EQ(BTM_SEC_IN_USE, device_record->sec_flags);
+  device_record->bd_addr = bd_addr;
+  device_record->hci_handle = classic_handle;
+  device_record->ble_hci_handle = ble_handle;
+
+  // With classic device encryption enable
+  btm_sec_encrypt_change(classic_handle, HCI_SUCCESS, 0x01);
+  ASSERT_EQ(BTM_SEC_IN_USE | BTM_SEC_AUTHENTICATED | BTM_SEC_ENCRYPTED,
+            device_record->sec_flags);
+
+  // With classic device encryption disable
+  btm_sec_encrypt_change(classic_handle, HCI_SUCCESS, 0x00);
+  ASSERT_EQ(BTM_SEC_IN_USE | BTM_SEC_AUTHENTICATED, device_record->sec_flags);
+  device_record->sec_flags = BTM_SEC_IN_USE;
+
+  // With le device encryption enable
+  btm_sec_encrypt_change(ble_handle, HCI_SUCCESS, 0x01);
+  ASSERT_EQ(BTM_SEC_IN_USE | BTM_SEC_LE_AUTHENTICATED | BTM_SEC_LE_ENCRYPTED,
+            device_record->sec_flags);
+
+  // With le device encryption disable
+  btm_sec_encrypt_change(ble_handle, HCI_SUCCESS, 0x00);
+  ASSERT_EQ(BTM_SEC_IN_USE | BTM_SEC_LE_AUTHENTICATED,
+            device_record->sec_flags);
+  device_record->sec_flags = BTM_SEC_IN_USE;
+
+  wipe_secrets_and_remove(device_record);
+}
+
+TEST_F(StackBtmWithInitFreeTest, BTM_SetEncryption) {
+  const RawAddress bd_addr = RawAddress({0x11, 0x22, 0x33, 0x44, 0x55, 0x66});
+  const tBT_TRANSPORT transport{BT_TRANSPORT_LE};
+  tBTM_SEC_CALLBACK* p_callback{nullptr};
+  tBTM_BLE_SEC_ACT sec_act{BTM_BLE_SEC_ENCRYPT};
+
+  // No device
+  ASSERT_EQ(BTM_WRONG_MODE, BTM_SetEncryption(bd_addr, transport, p_callback,
+                                              nullptr, sec_act));
+
+  // With device
+  tBTM_SEC_DEV_REC* device_record = btm_sec_allocate_dev_rec();
+  ASSERT_NE(nullptr, device_record);
+  device_record->bd_addr = bd_addr;
+  device_record->hci_handle = 0x1234;
+
+  ASSERT_EQ(BTM_WRONG_MODE, BTM_SetEncryption(bd_addr, transport, p_callback,
+                                              nullptr, sec_act));
+
+  wipe_secrets_and_remove(device_record);
+}

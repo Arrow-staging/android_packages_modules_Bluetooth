@@ -145,6 +145,12 @@ static int get_metric_id(const RawAddress& address) { return 0; }
 
 static int set_dynamic_audio_buffer_size(int codec, int size) { return 0; }
 
+static bool allow_low_latency_audio(bool allowed, const RawAddress& address) {
+  return true;
+}
+
+static int clear_event_filter(void) { return 0; }
+
 EXPORT_SYMBOL bt_interface_t bluetoothInterface = {
     sizeof(bluetoothInterface),
     init,
@@ -183,7 +189,9 @@ EXPORT_SYMBOL bt_interface_t bluetoothInterface = {
     obfuscate_address,
     get_metric_id,
     set_dynamic_audio_buffer_size,
-    generate_local_oob_data};
+    generate_local_oob_data,
+    allow_low_latency_audio,
+    clear_event_filter};
 
 // callback reporting helpers
 
@@ -221,6 +229,9 @@ void invoke_bond_state_changed_cb(bt_status_t status, RawAddress bd_addr,
 
 void invoke_address_consolidate_cb(RawAddress main_bd_addr,
                                    RawAddress secondary_bd_addr) {}
+
+void invoke_le_address_associate_cb(RawAddress main_bd_addr,
+                                    RawAddress secondary_bd_addr) {}
 
 void invoke_acl_state_changed_cb(bt_status_t status, RawAddress bd_addr,
                                  bt_acl_state_t state, int transport_link_type,

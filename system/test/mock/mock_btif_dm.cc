@@ -106,6 +106,9 @@ void btif_dm_hh_open_failed(RawAddress* bdaddr) {
   mock_function_count_map[__func__]++;
 }
 void btif_dm_init(uid_set_t* set) { mock_function_count_map[__func__]++; }
+void btif_dm_get_local_class_of_device(DEV_CLASS device_class) {
+  mock_function_count_map[__func__]++;
+}
 void btif_dm_load_ble_local_keys(void) { mock_function_count_map[__func__]++; }
 void btif_dm_on_disable() { mock_function_count_map[__func__]++; }
 void btif_dm_pin_reply(const RawAddress bd_addr, uint8_t accept,
@@ -160,4 +163,12 @@ bool btif_dm_proc_rmt_oob(const RawAddress& bd_addr, Octet16* p_c,
 void btif_dm_proc_loc_oob(tBT_TRANSPORT transport, bool is_valid,
                           const Octet16& c, const Octet16& r) {
   mock_function_count_map[__func__]++;
+}
+bool btif_get_device_type(const RawAddress& bda, int* p_device_type) {
+  mock_function_count_map[__func__]++;
+  return false;
+}
+bool btif_get_address_type(const RawAddress& bda, tBLE_ADDR_TYPE* p_addr_type) {
+  mock_function_count_map[__func__]++;
+  return false;
 }

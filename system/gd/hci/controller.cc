@@ -35,14 +35,12 @@ struct Controller::impl {
   void Start(hci::HciLayer* hci) {
     hci_ = hci;
     Handler* handler = module_.GetHandler();
-    if (common::init_flags::gd_acl_is_enabled() || common::init_flags::gd_l2cap_is_enabled()) {
-      hci_->RegisterEventHandler(
-          EventCode::NUMBER_OF_COMPLETED_PACKETS, handler->BindOn(this, &Controller::impl::NumberOfCompletedPackets));
-    }
+    hci_->RegisterEventHandler(
+        EventCode::NUMBER_OF_COMPLETED_PACKETS, handler->BindOn(this, &Controller::impl::NumberOfCompletedPackets));
 
     le_set_event_mask(kDefaultLeEventMask);
     set_event_mask(kDefaultEventMask);
-    write_le_host_support(Enable::ENABLED);
+    write_le_host_support(Enable::ENABLED, Enable::DISABLED);
     hci_->EnqueueCommand(ReadLocalNameBuilder::Create(),
                          handler->BindOnceOn(this, &Controller::impl::read_local_name_complete_handler));
     hci_->EnqueueCommand(ReadLocalVersionInformationBuilder::Create(),
@@ -80,7 +78,7 @@ struct Controller::impl {
     }
 
     hci_->EnqueueCommand(
-        LeReadConnectListSizeBuilder::Create(),
+        LeReadFilterAcceptListSizeBuilder::Create(),
         handler->BindOnceOn(this, &Controller::impl::le_read_connect_list_size_handler));
 
     if (is_supported(OpCode::LE_READ_RESOLVING_LIST_SIZE) && module_.SupportsBlePrivacy()) {
@@ -148,7 +146,7 @@ struct Controller::impl {
       LOG_INFO("LE_READ_PERIODIC_ADVERTISING_LIST_SIZE not supported, defaulting to 0");
       le_periodic_advertiser_list_size_ = 0;
     }
-    if (is_supported(OpCode::LE_SET_HOST_FEATURE)) {
+    if (is_supported(OpCode::LE_SET_HOST_FEATURE) && module_.SupportsBleConnectedIsochronousStreamCentral()) {
       hci_->EnqueueCommand(
           LeSetHostFeatureBuilder::Create(LeHostFeatureBits::CONNECTED_ISO_STREAM_HOST_SUPPORT, Enable::ENABLED),
           handler->BindOnceOn(this, &Controller::impl::le_set_host_feature_handler));
@@ -262,11 +260,10 @@ struct Controller::impl {
     ErrorCode status = complete_view.GetStatus();
     ASSERT_LOG(status == ErrorCode::SUCCESS, "Status 0x%02hhx, %s", status, ErrorCodeText(status).c_str());
     uint8_t page_number = complete_view.GetPageNumber();
-    maximum_page_number_ = complete_view.GetMaximumPageNumber();
     extended_lmp_features_array_.push_back(complete_view.GetExtendedLmpFeatures());
 
     // Query all extended features
-    if (page_number < maximum_page_number_) {
+    if (page_number < complete_view.GetMaximumPageNumber()) {
       page_number++;
       hci_->EnqueueCommand(
           ReadLocalExtendedFeaturesBuilder::Create(page_number),
@@ -355,11 +352,11 @@ struct Controller::impl {
   }
 
   void le_read_connect_list_size_handler(CommandCompleteView view) {
-    auto complete_view = LeReadConnectListSizeCompleteView::Create(view);
+    auto complete_view = LeReadFilterAcceptListSizeCompleteView::Create(view);
     ASSERT(complete_view.IsValid());
     ErrorCode status = complete_view.GetStatus();
     ASSERT_LOG(status == ErrorCode::SUCCESS, "Status 0x%02hhx, %s", status, ErrorCodeText(status).c_str());
-    le_connect_list_size_ = complete_view.GetConnectListSize();
+    le_connect_list_size_ = complete_view.GetFilterAcceptListSize();
   }
 
   void le_read_resolving_list_size_handler(CommandCompleteView view) {
@@ -490,10 +487,12 @@ struct Controller::impl {
                                                 this, &Controller::impl::check_status<SetEventMaskCompleteView>));
   }
 
-  void write_le_host_support(Enable enable) {
-    // Since Bluetooth Core Spec 4.1, this bit should be 0, but some controllers still require it
-    Enable simultaneous_le_host = Enable::ENABLED;
-    std::unique_ptr<WriteLeHostSupportBuilder> packet = WriteLeHostSupportBuilder::Create(enable, simultaneous_le_host);
+  void write_le_host_support(Enable enable, Enable deprecated_host_bit) {
+    if (deprecated_host_bit == Enable::ENABLED) {
+      // Since Bluetooth Core Spec 4.1, this bit should be 0
+      LOG_WARN("Setting deprecated Simultaneous LE BR/EDR Host bit");
+    }
+    std::unique_ptr<WriteLeHostSupportBuilder> packet = WriteLeHostSupportBuilder::Create(enable, deprecated_host_bit);
     hci_->EnqueueCommand(
         std::move(packet),
         module_.GetHandler()->BindOnceOn(this, &Controller::impl::check_status<WriteLeHostSupportCompleteView>));
@@ -710,10 +709,10 @@ struct Controller::impl {
       OP_CODE_MAPPING(LE_SET_SCAN_ENABLE)
       OP_CODE_MAPPING(LE_CREATE_CONNECTION)
       OP_CODE_MAPPING(LE_CREATE_CONNECTION_CANCEL)
-      OP_CODE_MAPPING(LE_READ_CONNECT_LIST_SIZE)
-      OP_CODE_MAPPING(LE_CLEAR_CONNECT_LIST)
-      OP_CODE_MAPPING(LE_ADD_DEVICE_TO_CONNECT_LIST)
-      OP_CODE_MAPPING(LE_REMOVE_DEVICE_FROM_CONNECT_LIST)
+      OP_CODE_MAPPING(LE_READ_FILTER_ACCEPT_LIST_SIZE)
+      OP_CODE_MAPPING(LE_CLEAR_FILTER_ACCEPT_LIST)
+      OP_CODE_MAPPING(LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST)
+      OP_CODE_MAPPING(LE_REMOVE_DEVICE_FROM_FILTER_ACCEPT_LIST)
       OP_CODE_MAPPING(LE_CONNECTION_UPDATE)
       OP_CODE_MAPPING(LE_SET_HOST_CHANNEL_CLASSIFICATION)
       OP_CODE_MAPPING(LE_READ_CHANNEL_MAP)
@@ -755,10 +754,10 @@ struct Controller::impl {
       OP_CODE_MAPPING(LE_SET_PHY)
       OP_CODE_MAPPING(LE_ENHANCED_RECEIVER_TEST)
       OP_CODE_MAPPING(LE_ENHANCED_TRANSMITTER_TEST)
-      OP_CODE_MAPPING(LE_SET_EXTENDED_ADVERTISING_RANDOM_ADDRESS)
+      OP_CODE_MAPPING(LE_SET_ADVERTISING_SET_RANDOM_ADDRESS)
       OP_CODE_MAPPING(LE_SET_EXTENDED_ADVERTISING_PARAMETERS)
       OP_CODE_MAPPING(LE_SET_EXTENDED_ADVERTISING_DATA)
-      OP_CODE_MAPPING(LE_SET_EXTENDED_ADVERTISING_SCAN_RESPONSE)
+      OP_CODE_MAPPING(LE_SET_EXTENDED_SCAN_RESPONSE_DATA)
       OP_CODE_MAPPING(LE_SET_EXTENDED_ADVERTISING_ENABLE)
       OP_CODE_MAPPING(LE_READ_MAXIMUM_ADVERTISING_DATA_LENGTH)
       OP_CODE_MAPPING(LE_READ_NUMBER_OF_SUPPORTED_ADVERTISING_SETS)
@@ -817,6 +816,10 @@ struct Controller::impl {
       OP_CODE_MAPPING(CONFIGURE_DATA_PATH)
       OP_CODE_MAPPING(ENHANCED_FLUSH)
 
+      // deprecated
+      case OpCode::ADD_SCO_CONNECTION:
+        return false;
+
       // vendor specific
       case OpCode::LE_GET_VENDOR_CAPABILITIES:
         return vendor_capabilities_.is_supported_ == 0x01;
@@ -854,7 +857,6 @@ struct Controller::impl {
   CompletedAclPacketsCallback acl_monitor_credits_callback_{};
   LocalVersionInformation local_version_information_;
   std::array<uint8_t, 64> local_supported_commands_;
-  uint8_t maximum_page_number_;
   std::vector<uint64_t> extended_lmp_features_array_;
   uint16_t acl_buffer_length_ = 0;
   uint16_t acl_buffers_ = 0;
@@ -984,7 +986,7 @@ LOCAL_LE_FEATURE_ACCESSOR(SupportsBlePowerChangeIndication, 34)
 LOCAL_LE_FEATURE_ACCESSOR(SupportsBlePathLossMonitoring, 35)
 
 uint64_t Controller::GetLocalFeatures(uint8_t page_number) const {
-  if (page_number <= impl_->maximum_page_number_) {
+  if (page_number < impl_->extended_lmp_features_array_.size()) {
     return impl_->extended_lmp_features_array_[page_number];
   }
   return 0x00;
@@ -1104,7 +1106,7 @@ uint64_t Controller::GetLeSupportedStates() const {
   return impl_->le_supported_states_;
 }
 
-uint8_t Controller::GetLeConnectListSize() const {
+uint8_t Controller::GetLeFilterAcceptListSize() const {
   return impl_->le_connect_list_size_;
 }
 

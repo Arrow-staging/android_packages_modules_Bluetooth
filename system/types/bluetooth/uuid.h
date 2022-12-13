@@ -106,6 +106,9 @@ class Uuid final {
   // Returns true if this UUID is equal to kEmpty
   bool IsEmpty() const;
 
+  // Returns true if this UUID is equal to kBase
+  bool IsBase() const;
+
   // Update UUID with new value
   void UpdateUuid(const Uuid& uuid);
 
@@ -119,12 +122,13 @@ class Uuid final {
   // Network-byte-ordered ID (Big Endian).
   UUID128Bit uu;
 };
-}  // namespace bluetooth
 
 inline std::ostream& operator<<(std::ostream& os, const bluetooth::Uuid& a) {
   os << a.ToString();
   return os;
 }
+
+}  // namespace bluetooth
 
 // Custom std::hash specialization so that bluetooth::UUID can be used as a key
 // in std::unordered_map.

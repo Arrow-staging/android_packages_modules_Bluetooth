@@ -1,14 +1,12 @@
-set noparent
-
 # Project owners
-cmanton@google.com
-cncn@google.com
-hsz@google.com
-jpawlowski@google.com
-mylesgw@google.com
-optedoblivion@google.com
-qasimj@google.com
-rahulsabnis@google.com
 sattiraju@google.com
 siyuanh@google.com
+sungsoo@google.com
 zachoverflow@google.com
+
+# Per-file ownership
+
+# ChromeOS team owns Linux build files
+# - build.py is used for Linux build
+# - *.gn is for GN build rules
+per-file build.py,*.gn=file:/OWNERS_chromeos

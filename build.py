@@ -34,6 +34,7 @@ import shutil
 import six
 import subprocess
 import sys
+import tarfile
 import time
 
 # Use flags required by common-mk (find -type f | grep -nE 'use[.]' {})
@@ -58,13 +59,15 @@ USE_DEFAULTS = {
 }
 
 VALID_TARGETS = [
-    'prepare',  # Prepare the output directory (gn gen + rust setup)
-    'tools',  # Build the host tools (i.e. packetgen)
-    'rust',  # Build only the rust components + copy artifacts to output dir
-    'main',  # Build the main C++ codebase
-    'test',  # Run the unit tests
-    'clean',  # Clean up output directory
     'all',  # All targets except test and clean
+    'clean',  # Clean up output directory
+    'docs',  # Build Rust docs
+    'main',  # Build the main C++ codebase
+    'prepare',  # Prepare the output directory (gn gen + rust setup)
+    'rootcanal',  # Build Rust targets for RootCanal
+    'rust',  # Build only the rust components + copy artifacts to output dir
+    'test',  # Run the unit tests
+    'tools',  # Build the host tools (i.e. packetgen)
 ]
 
 # TODO(b/190750167) - Host tests are disabled until we are full bazel build
@@ -97,19 +100,24 @@ REQUIRED_APT_PACKAGES = [
     'generate-ninja',
     'gnupg',
     'gperf',
+    'libc++abi-dev',
     'libc++-dev',
     'libdbus-1-dev',
+    'libdouble-conversion-dev',
     'libevent-dev',
     'libevent-dev',
     'libflatbuffers-dev',
     'libflatbuffers1',
     'libgl1-mesa-dev',
     'libglib2.0-dev',
+    'libgtest-dev',
+    'libgmock-dev',
     'liblz4-tool',
     'libncurses5',
     'libnss3-dev',
     'libprotobuf-dev',
     'libre2-9',
+    'libre2-dev',
     'libssl-dev',
     'libtinyxml2-dev',
     'libx11-dev',
@@ -185,6 +193,7 @@ class HostBuild():
         self.platform_dir = os.path.join(self.bootstrap_dir, 'staging')
         self.sysroot = self.args.sysroot
         self.libdir = self.args.libdir
+        self.install_dir = os.path.join(self.output_dir, 'install')
 
         # If default target isn't set, build everything
         self.target = 'all'
@@ -325,7 +334,7 @@ class HostBuild():
             'libbase_ver': self._get_basever(),
             'enable_exceptions': os.environ.get('CXXEXCEPTIONS', 0) == '1',
             'external_cflags': [],
-            'external_cxxflags': [],
+            'external_cxxflags': ["-DNDEBUG"],
             'enable_werror': False,
         }
 
@@ -411,14 +420,19 @@ class HostBuild():
         shutil.copy(
             os.path.join(self._gn_default_output(), 'bluetooth_packetgen'), os.path.join(self.env['CARGO_HOME'], 'bin'))
 
+    def _target_docs(self):
+        """Build the Rust docs."""
+        self.run_command('docs', ['cargo', 'doc'], cwd=os.path.join(self.platform_dir, 'bt'), env=self.env)
+
     def _target_rust(self):
         """ Build rust artifacts in an already prepared environment.
         """
         self._rust_build()
-        rust_dir = os.path.join(self._gn_default_output(), 'rust')
-        if os.path.exists(rust_dir):
-            shutil.rmtree(rust_dir)
-        shutil.copytree(os.path.join(self.output_dir, 'debug'), rust_dir)
+
+    def _target_rootcanal(self):
+        """ Build rust artifacts for RootCanal in an already prepared environment.
+        """
+        self.run_command('rust', ['cargo', 'build'], cwd=os.path.join(self.platform_dir, 'bt/tools/rootcanal'), env=self.env)
 
     def _target_main(self):
         """ Build the main GN artifacts in an already prepared environment.
@@ -429,7 +443,12 @@ class HostBuild():
         """ Runs the host tests.
         """
         # Rust tests first
-        self.run_command('test', ['cargo', 'test'], cwd=os.path.join(self.platform_dir, 'bt'), env=self.env)
+        rust_test_cmd = ['cargo', 'test']
+        if self.args.test_name:
+            rust_test_cmd = rust_test_cmd + [self.args.test_name]
+
+        self.run_command('test', rust_test_cmd, cwd=os.path.join(self.platform_dir, 'bt'), env=self.env)
+        self.run_command('test', rust_test_cmd, cwd=os.path.join(self.platform_dir, 'bt/tools/rootcanal'), env=self.env)
 
         # Host tests second based on host test list
         for t in HOST_TESTS:
@@ -438,15 +457,73 @@ class HostBuild():
                 cwd=os.path.join(self.output_dir),
                 env=self.env)
 
+    def _target_install(self):
+        """ Installs files required to run Floss to install directory.
+        """
+        # First make the install directory
+        prefix = self.install_dir
+        os.makedirs(prefix, exist_ok=True)
+
+        # Next save the cwd and change to install directory
+        last_cwd = os.getcwd()
+        os.chdir(prefix)
+
+        bindir = os.path.join(self.output_dir, 'debug')
+        srcdir = os.path.dirname(__file__)
+
+        install_map = [
+            {
+                'src': os.path.join(bindir, 'btadapterd'),
+                'dst': 'usr/libexec/bluetooth/btadapterd',
+                'strip': True
+            },
+            {
+                'src': os.path.join(bindir, 'btmanagerd'),
+                'dst': 'usr/libexec/bluetooth/btmanagerd',
+                'strip': True
+            },
+            {
+                'src': os.path.join(bindir, 'btclient'),
+                'dst': 'usr/local/bin/btclient',
+                'strip': True
+            },
+        ]
+
+        for v in install_map:
+            src, partial_dst, strip = (v['src'], v['dst'], v['strip'])
+            dst = os.path.join(prefix, partial_dst)
+
+            # Create dst directory first and copy file there
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            print('Installing {}'.format(dst))
+            shutil.copy(src, dst)
+
+            # Binary should be marked for strip and no-strip option shouldn't be
+            # set. No-strip is useful while debugging.
+            if strip and not self.args.no_strip:
+                self.run_command('install', ['llvm-strip', dst])
+
+        # Put all files into a tar.gz for easier installation
+        tar_location = os.path.join(prefix, 'floss.tar.gz')
+        with tarfile.open(tar_location, 'w:gz') as tar:
+            for v in install_map:
+                tar.add(v['dst'])
+
+        print('Tarball created at {}'.format(tar_location))
+
     def _target_clean(self):
         """ Delete the output directory entirely.
         """
         shutil.rmtree(self.output_dir)
+
         # Remove Cargo.lock that may have become generated
-        os.remove(os.path.join(self.platform_dir, 'bt', 'Cargo.lock'))
+        try:
+            os.remove(os.path.join(self.platform_dir, 'bt', 'Cargo.lock'))
+        except FileNotFoundError:
+            pass
 
     def _target_all(self):
-        """ Build all common targets (skipping test and clean).
+        """ Build all common targets (skipping doc, test, and clean).
         """
         self._target_prepare()
         self._target_tools()
@@ -458,18 +535,29 @@ class HostBuild():
         """
         print('Building target ', self.target)
 
+        # Validate that the target is valid
+        if self.target not in VALID_TARGETS:
+            print('Target {} is not valid. Must be in {}', self.target, VALID_TARGETS)
+            return
+
         if self.target == 'prepare':
             self._target_prepare()
         elif self.target == 'tools':
             self._target_tools()
+        elif self.target == 'rootcanal':
+            self._target_rootcanal()
         elif self.target == 'rust':
             self._target_rust()
+        elif self.target == 'docs':
+            self._target_docs()
         elif self.target == 'main':
             self._target_main()
         elif self.target == 'test':
             self._target_test()
         elif self.target == 'clean':
             self._target_clean()
+        elif self.target == 'install':
+            self._target_install()
         elif self.target == 'all':
             self._target_all()
 
@@ -511,19 +599,18 @@ class Bootstrap():
         This will check out all the git repos and symlink everything correctly.
         """
 
-        # If already set up, exit early
+        # Create all directories we will need to use
+        for dirpath in [self.git_dir, self.staging_dir, self.output_dir, self.external_dir]:
+            os.makedirs(dirpath, exist_ok=True)
+
+        # If already set up, only update platform2
         if os.path.isfile(self.dir_setup_complete):
             print('{} already set-up. Updating instead.'.format(self.base_dir))
             self._update_platform2()
-            return
-
-        # Create all directories we will need to use
-        for dirpath in [self.git_dir, self.staging_dir, self.output_dir, self.external_dir]:
-            os.makedirs(dirpath)
-
-        # Check out all repos in git directory
-        for repo in BOOTSTRAP_GIT_REPOS.values():
-            subprocess.check_call(['git', 'clone', repo], cwd=self.git_dir)
+        else:
+            # Check out all repos in git directory
+            for repo in BOOTSTRAP_GIT_REPOS.values():
+                subprocess.check_call(['git', 'clone', repo], cwd=self.git_dir)
 
         # Symlink things
         symlinks = [
@@ -537,6 +624,10 @@ class Bootstrap():
         # Create symlinks
         for pairs in symlinks:
             (src, dst) = pairs
+            try:
+                os.unlink(dst)
+            except Exception as e:
+                print(e)
             os.symlink(src, dst)
 
         # Write to setup complete file so we don't repeat this step
@@ -698,8 +789,11 @@ if __name__ == '__main__':
         default=False,
         action='store_true')
     parser.add_argument('--no-clang', help='Use clang compiler.', default=False, action='store_true')
+    parser.add_argument(
+        '--no-strip', help='Skip stripping binaries during install.', default=False, action='store_true')
     parser.add_argument('--use', help='Set a specific use flag.')
-    parser.add_argument('--notest', help="Don't compile test code.", default=False, action='store_true')
+    parser.add_argument('--notest', help='Don\'t compile test code.', default=False, action='store_true')
+    parser.add_argument('--test-name', help='Run test with this string in the name.', default=None)
     parser.add_argument('--target', help='Run specific build target')
     parser.add_argument('--sysroot', help='Set a specific sysroot path', default='/')
     parser.add_argument('--libdir', help='Libdir - default = usr/lib', default='usr/lib')

@@ -289,21 +289,6 @@ tBTM_STATUS BTM_ClearInqDb(const RawAddress* p_bda);
 
 /*******************************************************************************
  *
- * Function         BTM_WriteEIR
- *
- * Description      This function is called to write EIR data to controller.
- *
- * Parameters       p_buff - allocated HCI command buffer including extended
- *                           inquriry response
- *
- * Returns          BTM_SUCCESS  - if successful
- *                  BTM_MODE_UNSUPPORTED - if local device cannot support it
- *
- ******************************************************************************/
-tBTM_STATUS BTM_WriteEIR(BT_HDR* p_buff);
-
-/*******************************************************************************
- *
  * Function         BTM_HasEirService
  *
  * Description      This function is called to know if UUID in bit map of UUID.
@@ -348,21 +333,6 @@ tBTM_EIR_SEARCH_RESULT BTM_HasInquiryEirService(tBTM_INQ_RESULTS* p_results,
  *
  ******************************************************************************/
 void BTM_AddEirService(uint32_t* p_eir_uuid, uint16_t uuid16);
-
-/*******************************************************************************
- *
- * Function         BTM_RemoveEirService
- *
- * Description      This function is called to remove a service from the bit map
- *                  UUID list.
- *
- * Parameters       p_eir_uuid - bit mask of UUID list for EIR
- *                  uuid16 - UUID 16-bit
- *
- * Returns          None
- *
- ******************************************************************************/
-void BTM_RemoveEirService(uint32_t* p_eir_uuid, uint16_t uuid16);
 
 /*******************************************************************************
  *
@@ -855,7 +825,7 @@ tBTM_STATUS BTM_SetDeviceClass(DEV_CLASS dev_class);
  *                              is returned and p_name is set to NULL
  *
  ******************************************************************************/
-tBTM_STATUS BTM_ReadLocalDeviceName(char** p_name);
+tBTM_STATUS BTM_ReadLocalDeviceName(const char** p_name);
 
 /*******************************************************************************
  *
@@ -1403,8 +1373,8 @@ uint8_t BTM_SecClrService(uint8_t service_id);
  *
  ******************************************************************************/
 bool BTM_SecAddDevice(const RawAddress& bd_addr, DEV_CLASS dev_class,
-                      BD_NAME bd_name, uint8_t* features, LinkKey* link_key,
-                      uint8_t key_type, uint8_t pin_length);
+                      const BD_NAME& bd_name, uint8_t* features,
+                      LinkKey* link_key, uint8_t key_type, uint8_t pin_length);
 
 /** Free resources associated with the device associated with |bd_addr| address.
  *
@@ -1839,6 +1809,26 @@ bool BTM_BleLocalPrivacyEnabled(void);
  *
  ******************************************************************************/
 tBTM_STATUS BTM_BleGetEnergyInfo(tBTM_BLE_ENERGY_INFO_CBACK* p_ener_cback);
+
+/*******************************************************************************
+ *
+ * Function         BTM_ClearEventFilter
+ *
+ * Description      Clears the event filter in the controller
+ *
+ * Returns          Return btm status
+ *
+ ******************************************************************************/
+tBTM_STATUS BTM_ClearEventFilter(void);
+
+/*******************************************************************************
+ *
+ * Function         BTM_BleResetId
+ *
+ * Description      Resets the local BLE keys
+ *
+ *******************************************************************************/
+tBTM_STATUS BTM_BleResetId(void);
 
 /**
  * Send remote name request to GD shim Name module

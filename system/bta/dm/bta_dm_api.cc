@@ -61,7 +61,7 @@ void BTA_EnableTestMode(void) {
 }
 
 /** This function sets the Bluetooth name of local device */
-void BTA_DmSetDeviceName(char* p_name) {
+void BTA_DmSetDeviceName(const char* p_name) {
   std::vector<uint8_t> name(BD_NAME_LEN + 1);
   strlcpy((char*)name.data(), p_name, BD_NAME_LEN + 1);
 
@@ -80,16 +80,11 @@ void BTA_DmSetDeviceName(char* p_name) {
  * Returns          void
  *
  ******************************************************************************/
-void BTA_DmSearch(tBTA_DM_SEARCH_CBACK* p_cback, bool is_bonding_or_sdp) {
+void BTA_DmSearch(tBTA_DM_SEARCH_CBACK* p_cback) {
   tBTA_DM_API_SEARCH* p_msg =
       (tBTA_DM_API_SEARCH*)osi_calloc(sizeof(tBTA_DM_API_SEARCH));
 
-  /* Queue request if a device is bonding or performing service discovery */
-  if (is_bonding_or_sdp) {
-    p_msg->hdr.event = BTA_DM_API_QUEUE_SEARCH_EVT;
-  } else {
-    p_msg->hdr.event = BTA_DM_API_SEARCH_EVT;
-  }
+  p_msg->hdr.event = BTA_DM_API_SEARCH_EVT;
   p_msg->p_cback = p_cback;
 
   bta_sys_sendmsg(p_msg);
@@ -138,15 +133,11 @@ void BTA_DmSearchCancel(void) {
  *
  ******************************************************************************/
 void BTA_DmDiscover(const RawAddress& bd_addr, tBTA_DM_SEARCH_CBACK* p_cback,
-                    tBT_TRANSPORT transport, bool is_bonding_or_sdp) {
+                    tBT_TRANSPORT transport) {
   tBTA_DM_API_DISCOVER* p_msg =
       (tBTA_DM_API_DISCOVER*)osi_calloc(sizeof(tBTA_DM_API_DISCOVER));
 
-  if (is_bonding_or_sdp) {
-    p_msg->hdr.event = BTA_DM_API_QUEUE_DISCOVER_EVT;
-  } else {
-    p_msg->hdr.event = BTA_DM_API_DISCOVER_EVT;
-  }
+  p_msg->hdr.event = BTA_DM_API_DISCOVER_EVT;
   p_msg->bd_addr = bd_addr;
   p_msg->transport = transport;
   p_msg->p_cback = p_cback;
@@ -670,3 +661,31 @@ void BTA_DmBleCsisObserve(bool observe, tBTA_DM_SEARCH_CBACK* p_results_cb) {
  *
  ******************************************************************************/
 void BTA_VendorInit(void) { APPL_TRACE_API("BTA_VendorInit"); }
+
+/*******************************************************************************
+ *
+ * Function         BTA_DmClearEventFilter
+ *
+ * Description      This function clears the event filter
+ *
+ * Returns          void
+ *
+ ******************************************************************************/
+void BTA_DmClearEventFilter(void) {
+  APPL_TRACE_API("BTA_DmClearEventFilter");
+  do_in_main_thread(FROM_HERE, base::Bind(bta_dm_clear_event_filter));
+}
+
+/*******************************************************************************
+ *
+ * Function         BTA_DmBleResetId
+ *
+ * Description      This function resets the ble keys such as IRK
+ *
+ * Returns          void
+ *
+ ******************************************************************************/
+void BTA_DmBleResetId(void) {
+  APPL_TRACE_API("BTA_DmBleResetId");
+  do_in_main_thread(FROM_HERE, base::Bind(bta_dm_ble_reset_id));
+}

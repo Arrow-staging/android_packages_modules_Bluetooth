@@ -33,8 +33,6 @@
 #include "types/hci_role.h"
 #include "types/raw_address.h"
 
-typedef char tBTM_LOC_BD_NAME[BTM_MAX_LOC_BD_NAME_LEN + 1];
-
 typedef struct {
   uint16_t min_conn_int;
   uint16_t max_conn_int;
@@ -97,7 +95,14 @@ typedef struct {
 typedef struct {
   RawAddress pseudo_addr; /* LE pseudo address of the device if different from
                           device address  */
-  tBLE_ADDR_TYPE ble_addr_type; /* LE device type: public or random address */
+ private:
+  tBLE_ADDR_TYPE ble_addr_type_; /* LE device type: public or random address */
+
+ public:
+  tBLE_ADDR_TYPE AddressType() const { return ble_addr_type_; }
+  void SetAddressType(tBLE_ADDR_TYPE ble_addr_type) {
+    if (is_ble_addr_type_known(ble_addr_type)) ble_addr_type_ = ble_addr_type;
+  }
 
   tBLE_BD_ADDR identity_address_with_type;
 
@@ -174,7 +179,7 @@ static inline std::string security_state_text(const tSECURITY_STATE& state) {
     CASE_RETURN_TEXT(BTM_SEC_STATE_DISCONNECTING_BLE);
     CASE_RETURN_TEXT(BTM_SEC_STATE_DISCONNECTING_BOTH);
     default:
-      return std::string("UNKNOWN[%hhu]", state);
+      return base::StringPrintf("UNKNOWN[%hhu]", state);
   }
 }
 
@@ -217,6 +222,7 @@ struct tBTM_SEC_DEV_REC {
   RawAddress bd_addr;      /* BD_ADDR of the device              */
   DEV_CLASS dev_class;     /* DEV_CLASS of the device            */
   LinkKey link_key;        /* Device link key                    */
+  tHCI_STATUS sec_status;      /* status for pin_or_key_missing      */
 
  public:
   RawAddress RemoteAddress() const { return bd_addr; }
@@ -224,7 +230,7 @@ struct tBTM_SEC_DEV_REC {
 
  private:
   friend bool BTM_SecAddDevice(const RawAddress& bd_addr, DEV_CLASS dev_class,
-                               BD_NAME bd_name, uint8_t* features,
+                               const BD_NAME& bd_name, uint8_t* features,
                                LinkKey* p_link_key, uint8_t key_type,
                                uint8_t pin_length);
   friend void BTM_PINCodeReply(const RawAddress& bd_addr, tBTM_STATUS res,
@@ -313,7 +319,7 @@ struct tBTM_SEC_DEV_REC {
   tBTM_BD_NAME sec_bd_name; /* User friendly name of the device. (may be
                                truncated to save space in dev_rec table) */
 
-  uint8_t sec_state;          /* Operating state                    */
+  tSECURITY_STATE sec_state; /* Operating state                    */
   bool is_security_state_idle() const {
     return sec_state == BTM_SEC_STATE_IDLE;
   }

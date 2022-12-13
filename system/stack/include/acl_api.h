@@ -192,7 +192,8 @@ bool BTM_BLE_IS_RESOLVE_BDA(const RawAddress& x);
 
 bool acl_refresh_remote_address(const RawAddress& identity_address,
                                 tBLE_ADDR_TYPE identity_address_type,
-                                const RawAddress& remote_bda, uint8_t rra_type,
+                                const RawAddress& remote_bda,
+                                tBTM_SEC_BLE::tADDRESS_TYPE rra_type,
                                 const RawAddress& rpa);
 
 void btm_establish_continue_from_address(const RawAddress& remote_bda,
@@ -203,6 +204,7 @@ bool acl_peer_supports_ble_connection_parameters_request(
 
 bool sco_peer_supports_esco_2m_phy(const RawAddress& remote_bda);
 bool sco_peer_supports_esco_3m_phy(const RawAddress& remote_bda);
+bool sco_peer_supports_esco_ev3(const RawAddress& remote_bda);
 
 bool acl_peer_supports_ble_packet_extension(uint16_t hci_handle);
 bool acl_peer_supports_ble_2m_phy(uint16_t hci_handle);
@@ -263,6 +265,9 @@ void btm_acl_notif_conn_collision(const RawAddress& bda);
 
 void btm_acl_update_conn_addr(uint16_t conn_handle, const RawAddress& address);
 
+void btm_configure_data_path(uint8_t direction, uint8_t path_id,
+                             std::vector<uint8_t> vendor_config);
+
 /*******************************************************************************
  *
  * Function         BTM_ReadPowerMode
@@ -289,8 +294,10 @@ void btm_acl_created(const RawAddress& bda, uint16_t hci_handle,
 
 void btm_acl_removed(uint16_t handle);
 
-void acl_disconnect_from_handle(uint16_t handle, tHCI_STATUS reason);
-void acl_disconnect_after_role_switch(uint16_t conn_handle, tHCI_STATUS reason);
+void acl_disconnect_from_handle(uint16_t handle, tHCI_STATUS reason,
+                                std::string comment);
+void acl_disconnect_after_role_switch(uint16_t conn_handle, tHCI_STATUS reason,
+                                      std::string comment);
 
 bool acl_peer_supports_sniff_subrating(const RawAddress& remote_bda);
 

@@ -76,6 +76,7 @@ struct sco_peer_supports_esco_3m_phy sco_peer_supports_esco_3m_phy;
 struct acl_create_classic_connection acl_create_classic_connection;
 struct IsEprAvailable IsEprAvailable;
 struct acl_get_connection_from_address acl_get_connection_from_address;
+struct btm_acl_for_bda btm_acl_for_bda;
 struct acl_get_connection_from_handle acl_get_connection_from_handle;
 struct BTM_GetLinkSuperTout BTM_GetLinkSuperTout;
 struct BTM_GetRole BTM_GetRole;
@@ -136,6 +137,7 @@ struct btm_acl_resubmit_page btm_acl_resubmit_page;
 struct btm_acl_role_changed btm_acl_role_changed;
 struct btm_acl_set_paging btm_acl_set_paging;
 struct btm_acl_update_conn_addr btm_acl_update_conn_addr;
+struct btm_configure_data_path btm_configure_data_path;
 struct btm_acl_update_inquiry_status btm_acl_update_inquiry_status;
 struct btm_ble_refresh_local_resolvable_private_addr
     btm_ble_refresh_local_resolvable_private_addr;
@@ -158,11 +160,7 @@ struct btm_read_remote_ext_features_complete_raw
     btm_read_remote_ext_features_complete_raw;
 struct btm_read_remote_ext_features_failed btm_read_remote_ext_features_failed;
 struct btm_read_remote_features_complete btm_read_remote_features_complete;
-struct btm_read_remote_features_complete_raw
-    btm_read_remote_features_complete_raw;
 struct btm_read_remote_version_complete btm_read_remote_version_complete;
-struct btm_read_remote_version_complete_raw
-    btm_read_remote_version_complete_raw;
 struct btm_read_rssi_complete btm_read_rssi_complete;
 struct btm_read_rssi_timeout btm_read_rssi_timeout;
 struct btm_read_tx_power_complete btm_read_tx_power_complete;
@@ -271,7 +269,8 @@ bool acl_peer_supports_sniff_subrating(const RawAddress& remote_bda) {
 }
 bool acl_refresh_remote_address(const RawAddress& identity_address,
                                 tBLE_ADDR_TYPE identity_address_type,
-                                const RawAddress& bda, tBLE_ADDR_TYPE rra_type,
+                                const RawAddress& bda,
+                                tBTM_SEC_BLE::tADDRESS_TYPE rra_type,
                                 const RawAddress& rpa) {
   mock_function_count_map[__func__]++;
   return test::mock::stack_acl::acl_refresh_remote_address(
@@ -311,6 +310,10 @@ tACL_CONN* acl_get_connection_from_address(const RawAddress& bd_addr,
   mock_function_count_map[__func__]++;
   return test::mock::stack_acl::acl_get_connection_from_address(bd_addr,
                                                                 transport);
+}
+tACL_CONN* btm_acl_for_bda(const RawAddress& bd_addr, tBT_TRANSPORT transport) {
+  mock_function_count_map[__func__]++;
+  return test::mock::stack_acl::btm_acl_for_bda(bd_addr, transport);
 }
 tACL_CONN* acl_get_connection_from_handle(uint16_t handle) {
   mock_function_count_map[__func__]++;
@@ -448,14 +451,16 @@ void acl_accept_connection_request(const RawAddress& bd_addr, uint8_t role) {
   mock_function_count_map[__func__]++;
   test::mock::stack_acl::acl_accept_connection_request(bd_addr, role);
 }
-void acl_disconnect_after_role_switch(uint16_t conn_handle,
-                                      tHCI_STATUS reason) {
+void acl_disconnect_after_role_switch(uint16_t conn_handle, tHCI_STATUS reason,
+                                      std::string comment) {
   mock_function_count_map[__func__]++;
-  test::mock::stack_acl::acl_disconnect_after_role_switch(conn_handle, reason);
+  test::mock::stack_acl::acl_disconnect_after_role_switch(conn_handle, reason,
+                                                          comment);
 }
-void acl_disconnect_from_handle(uint16_t handle, tHCI_STATUS reason) {
+void acl_disconnect_from_handle(uint16_t handle, tHCI_STATUS reason,
+                                std::string comment) {
   mock_function_count_map[__func__]++;
-  test::mock::stack_acl::acl_disconnect_from_handle(handle, reason);
+  test::mock::stack_acl::acl_disconnect_from_handle(handle, reason, comment);
 }
 void acl_link_segments_xmitted(BT_HDR* p_msg) {
   mock_function_count_map[__func__]++;
@@ -570,6 +575,12 @@ void btm_acl_update_conn_addr(uint16_t handle, const RawAddress& address) {
   mock_function_count_map[__func__]++;
   test::mock::stack_acl::btm_acl_update_conn_addr(handle, address);
 }
+void btm_configure_data_path(uint8_t direction, uint8_t path_id,
+                             std::vector<uint8_t> vendor_config) {
+  mock_function_count_map[__func__]++;
+  test::mock::stack_acl::btm_configure_data_path(direction, path_id,
+                                                 vendor_config);
+}
 void btm_acl_update_inquiry_status(uint8_t status) {
   mock_function_count_map[__func__]++;
   test::mock::stack_acl::btm_acl_update_inquiry_status(status);
@@ -646,10 +657,6 @@ void btm_read_remote_features_complete(uint16_t handle, uint8_t* features) {
   mock_function_count_map[__func__]++;
   test::mock::stack_acl::btm_read_remote_features_complete(handle, features);
 }
-void btm_read_remote_features_complete_raw(uint8_t* p) {
-  mock_function_count_map[__func__]++;
-  test::mock::stack_acl::btm_read_remote_features_complete_raw(p);
-}
 void btm_read_remote_version_complete(tHCI_STATUS status, uint16_t handle,
                                       uint8_t lmp_version,
                                       uint16_t manufacturer,
@@ -657,10 +664,6 @@ void btm_read_remote_version_complete(tHCI_STATUS status, uint16_t handle,
   mock_function_count_map[__func__]++;
   test::mock::stack_acl::btm_read_remote_version_complete(
       status, handle, lmp_version, manufacturer, lmp_subversion);
-}
-void btm_read_remote_version_complete_raw(uint8_t* p) {
-  mock_function_count_map[__func__]++;
-  test::mock::stack_acl::btm_read_remote_version_complete_raw(p);
 }
 void btm_read_rssi_complete(uint8_t* p) {
   mock_function_count_map[__func__]++;

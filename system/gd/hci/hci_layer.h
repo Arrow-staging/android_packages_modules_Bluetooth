@@ -43,8 +43,10 @@ class HciLayer : public Module, public CommandInterface<CommandBuilder> {
   // LINT.IfChange
  public:
   HciLayer();
+  HciLayer(const HciLayer&) = delete;
+  HciLayer& operator=(const HciLayer&) = delete;
+
   virtual ~HciLayer();
-  DISALLOW_COPY_AND_ASSIGN(HciLayer);
 
   void EnqueueCommand(
       std::unique_ptr<CommandBuilder> command,
@@ -78,12 +80,14 @@ class HciLayer : public Module, public CommandInterface<CommandBuilder> {
       common::ContextualCallback<void(uint16_t, hci::ErrorCode)> on_disconnect,
       common::ContextualCallback<void(hci::ErrorCode, uint16_t, uint8_t, uint16_t, uint16_t)>
           on_read_remote_version_complete);
+  virtual void PutAclConnectionInterface();
 
   virtual LeAclConnectionInterface* GetLeAclConnectionInterface(
       common::ContextualCallback<void(LeMetaEventView)> event_handler,
       common::ContextualCallback<void(uint16_t, hci::ErrorCode)> on_disconnect,
       common::ContextualCallback<void(hci::ErrorCode, uint16_t, uint8_t, uint16_t, uint16_t)>
           on_read_remote_version_complete);
+  virtual void PutLeAclConnectionInterface();
 
   virtual LeAdvertisingInterface* GetLeAdvertisingInterface(
       common::ContextualCallback<void(LeMetaEventView)> event_handler);
@@ -114,6 +118,10 @@ class HciLayer : public Module, public CommandInterface<CommandBuilder> {
       hci::ErrorCode hci_status, uint16_t handle, uint8_t version, uint16_t manufacturer_name, uint16_t sub_version);
   virtual void RegisterLeMetaEventHandler(common::ContextualCallback<void(EventView)> event_handler);
 
+  std::list<common::ContextualCallback<void(uint16_t, ErrorCode)>> disconnect_handlers_;
+  std::list<common::ContextualCallback<void(hci::ErrorCode, uint16_t, uint8_t, uint16_t, uint16_t)>>
+      read_remote_version_handlers_;
+
  private:
   struct impl;
   struct hal_callbacks;
@@ -138,9 +146,7 @@ class HciLayer : public Module, public CommandInterface<CommandBuilder> {
     HciLayer& hci_;
   };
 
-  std::list<common::ContextualCallback<void(uint16_t, ErrorCode)>> disconnect_handlers_;
-  std::list<common::ContextualCallback<void(hci::ErrorCode, uint16_t, uint8_t, uint16_t, uint16_t)>>
-      read_remote_version_handlers_;
+  std::mutex callback_handlers_guard_;
   void on_disconnection_complete(EventView event_view);
   void on_read_remote_version_complete(EventView event_view);
 

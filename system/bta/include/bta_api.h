@@ -25,6 +25,8 @@
 #ifndef BTA_API_H
 #define BTA_API_H
 
+#include <base/strings/stringprintf.h>
+
 #include <cstdint>
 #include <vector>
 
@@ -151,7 +153,7 @@ inline std::string preferred_role_text(const tBTA_PREF_ROLES& role) {
     CASE_RETURN_TEXT(BTA_CENTRAL_ROLE_ONLY);
     CASE_RETURN_TEXT(BTA_PERIPHERAL_ROLE_ONLY);
     default:
-      return std::string("UNKNOWN:%hhu", role);
+      return base::StringPrintf("UNKNOWN[%hhu]", role);
   }
 }
 #undef CASE_RETURN_TEXT
@@ -191,38 +193,38 @@ typedef struct {
 
 typedef uint8_t tBTA_DM_BLE_RSSI_ALERT_TYPE;
 
-/* Security Callback Events */
-#define BTA_DM_PIN_REQ_EVT 2   /* PIN request. */
-#define BTA_DM_AUTH_CMPL_EVT 3 /* Authentication complete indication. */
-#define BTA_DM_AUTHORIZE_EVT 4 /* Authorization request. */
-#define BTA_DM_LINK_UP_EVT 5   /* Connection UP event */
-#define BTA_DM_LINK_DOWN_EVT 6 /* Connection DOWN event */
-#define BTA_DM_BOND_CANCEL_CMPL_EVT 9 /* Bond cancel complete indication */
-#define BTA_DM_SP_CFM_REQ_EVT                     \
-  10 /* Simple Pairing User Confirmation request. \
-        */
-#define BTA_DM_SP_KEY_NOTIF_EVT 11 /* Simple Pairing Passkey Notification */
-#define BTA_DM_BLE_KEY_EVT 15      /* BLE SMP key event for peer device keys */
-#define BTA_DM_BLE_SEC_REQ_EVT 16  /* BLE SMP security request */
-#define BTA_DM_BLE_PASSKEY_NOTIF_EVT 17 /* SMP passkey notification event */
-#define BTA_DM_BLE_PASSKEY_REQ_EVT 18   /* SMP passkey request event */
-#define BTA_DM_BLE_OOB_REQ_EVT 19       /* SMP OOB request event */
-#define BTA_DM_BLE_LOCAL_IR_EVT 20      /* BLE local IR event */
-#define BTA_DM_BLE_LOCAL_ER_EVT 21      /* BLE local ER event */
-#define BTA_DM_BLE_NC_REQ_EVT 22 /* SMP Numeric Comparison request event */
-#define BTA_DM_SP_RMT_OOB_EXT_EVT \
-  23 /* Simple Pairing Remote OOB Extended Data request. */
-#define BTA_DM_BLE_AUTH_CMPL_EVT 24 /* BLE Auth complete */
-#define BTA_DM_DEV_UNPAIRED_EVT 25
-#define BTA_DM_LE_FEATURES_READ                                             \
-  27                             /* Cotroller specific LE features are read \
+typedef enum : uint8_t {
+  /* Security Callback Events */
+  BTA_DM_PIN_REQ_EVT = 2,          /* PIN request. */
+  BTA_DM_AUTH_CMPL_EVT = 3,        /* Authentication complete indication. */
+  BTA_DM_AUTHORIZE_EVT = 4,        /* Authorization request. */
+  BTA_DM_LINK_UP_EVT = 5,          /* Connection UP event */
+  BTA_DM_LINK_DOWN_EVT = 6,        /* Connection DOWN event */
+  BTA_DM_BOND_CANCEL_CMPL_EVT = 9, /* Bond cancel complete indication */
+  BTA_DM_SP_CFM_REQ_EVT = 10,   /* Simple Pairing User Confirmation request. \
+                                 */
+  BTA_DM_SP_KEY_NOTIF_EVT = 11, /* Simple Pairing Passkey Notification */
+  BTA_DM_BLE_KEY_EVT = 15,      /* BLE SMP key event for peer device keys */
+  BTA_DM_BLE_SEC_REQ_EVT = 16,  /* BLE SMP security request */
+  BTA_DM_BLE_PASSKEY_NOTIF_EVT = 17, /* SMP passkey notification event */
+  BTA_DM_BLE_PASSKEY_REQ_EVT = 18,   /* SMP passkey request event */
+  BTA_DM_BLE_OOB_REQ_EVT = 19,       /* SMP OOB request event */
+  BTA_DM_BLE_LOCAL_IR_EVT = 20,      /* BLE local IR event */
+  BTA_DM_BLE_LOCAL_ER_EVT = 21,      /* BLE local ER event */
+  BTA_DM_BLE_NC_REQ_EVT = 22,        /* SMP Numeric Comparison request event */
+  BTA_DM_SP_RMT_OOB_EXT_EVT =
+      23, /* Simple Pairing Remote OOB Extended Data request. */
+  BTA_DM_BLE_AUTH_CMPL_EVT = 24, /* BLE Auth complete */
+  BTA_DM_DEV_UNPAIRED_EVT = 25,
+  BTA_DM_LE_FEATURES_READ = 27,    /* Cotroller specific LE features are read \
                                     */
-#define BTA_DM_ENER_INFO_READ 28 /* Energy info read */
-#define BTA_DM_BLE_SC_OOB_REQ_EVT 29 /* SMP SC OOB request event */
-#define BTA_DM_BLE_CONSENT_REQ_EVT 30 /* SMP consent request event */
-#define BTA_DM_BLE_SC_CR_LOC_OOB_EVT \
-  31 /* SMP SC Create Local OOB request event */
-typedef uint8_t tBTA_DM_SEC_EVT;
+  BTA_DM_ENER_INFO_READ = 28,      /* Energy info read */
+  BTA_DM_BLE_SC_OOB_REQ_EVT = 29,  /* SMP SC OOB request event */
+  BTA_DM_BLE_CONSENT_REQ_EVT = 30, /* SMP consent request event */
+  BTA_DM_BLE_SC_CR_LOC_OOB_EVT = 31, /* SMP SC Create Local OOB request event */
+  BTA_DM_REPORT_BONDING_EVT = 32,    /*handle for pin or key missing*/
+  BTA_DM_LE_ADDR_ASSOC_EVT = 33,     /* identity address association event */
+} tBTA_DM_SEC_EVT;
 
 /* Structure associated with BTA_DM_PIN_REQ_EVT */
 typedef struct {
@@ -371,10 +373,20 @@ typedef struct {
   tBTA_STATUS result; /* true of bond cancel succeeded, false if failed. */
 } tBTA_DM_BOND_CANCEL_CMPL;
 
+/* Add to remove bond of key missing RC */
+typedef struct {
+  RawAddress bd_addr;
+} tBTA_DM_RC_UNPAIR;
+
 typedef struct {
   Octet16 local_oob_c; /* Local OOB Data Confirmation/Commitment */
   Octet16 local_oob_r; /* Local OOB Data Randomizer */
 } tBTA_DM_LOC_OOB_DATA;
+
+typedef struct {
+  RawAddress pairing_bda;
+  RawAddress id_addr;
+} tBTA_DM_PROC_ID_ADDR;
 
 /* Union of all security callback structures */
 typedef union {
@@ -392,6 +404,8 @@ typedef union {
   tBTA_BLE_LOCAL_ID_KEYS ble_id_keys; /* IR event */
   Octet16 ble_er;                     /* ER event data */
   tBTA_DM_LOC_OOB_DATA local_oob_data; /* Local OOB data generated by us */
+  tBTA_DM_RC_UNPAIR delete_key_RC_to_unpair;
+  tBTA_DM_PROC_ID_ADDR proc_id_addr; /* Identity address event */
 } tBTA_DM_SEC;
 
 /* Security callback */
@@ -434,6 +448,8 @@ typedef struct {
   tBT_DEVICE_TYPE device_type;
   uint8_t flag;
   bool include_rsi; /* true, if ADV contains RSI data */
+  RawAddress original_bda; /* original address to pass up to
+                              GattService#onScanResult */
 } tBTA_DM_INQ_RES;
 
 /* Structure associated with BTA_DM_INQ_CMPL_EVT */
@@ -447,7 +463,7 @@ typedef struct {
   BD_NAME bd_name;             /* Name of peer device. */
   tBTA_SERVICE_MASK services;  /* Services found on peer device. */
   tBT_DEVICE_TYPE device_type; /* device type in case it is BLE device */
-  uint32_t num_uuids;
+  size_t num_uuids;
   bluetooth::Uuid* p_uuid_list;
   tBTA_STATUS result;
 } tBTA_DM_DISC_RES;
@@ -675,7 +691,7 @@ extern void BTA_EnableTestMode(void);
  * Returns          void
  *
  ******************************************************************************/
-extern void BTA_DmSetDeviceName(char* p_name);
+extern void BTA_DmSetDeviceName(const char* p_name);
 
 /*******************************************************************************
  *
@@ -701,15 +717,13 @@ extern bool BTA_DmSetVisibility(bt_scan_mode_t mode);
  *                  first performs an inquiry; for each device found from the
  *                  inquiry it gets the remote name of the device.  If
  *                  parameter services is nonzero, service discovery will be
- *                  performed on each device for the services specified. If the
- *                  parameter is_bonding_or_sdp is true, the request will be
- *                  queued until bonding or sdp completes
+ *                  performed on each device for the services specified.
  *
  *
  * Returns          void
  *
  ******************************************************************************/
-extern void BTA_DmSearch(tBTA_DM_SEARCH_CBACK* p_cback, bool is_bonding_or_sdp);
+extern void BTA_DmSearch(tBTA_DM_SEARCH_CBACK* p_cback);
 
 /*******************************************************************************
  *
@@ -737,7 +751,7 @@ extern void BTA_DmSearchCancel(void);
  ******************************************************************************/
 extern void BTA_DmDiscover(const RawAddress& bd_addr,
                            tBTA_DM_SEARCH_CBACK* p_cback,
-                           tBT_TRANSPORT transport, bool is_bonding_or_sdp);
+                           tBT_TRANSPORT transport);
 
 /*******************************************************************************
  *
@@ -766,7 +780,7 @@ tBTA_STATUS BTA_DmGetCachedRemoteName(const RawAddress& remote_device,
  *
  ******************************************************************************/
 extern void BTA_DmBond(const RawAddress& bd_addr, tBLE_ADDR_TYPE addr_type,
-                       tBT_TRANSPORT transport, tBLE_ADDR_TYPE device_type);
+                       tBT_TRANSPORT transport, tBT_DEVICE_TYPE device_type);
 
 /*******************************************************************************
  *
@@ -1184,5 +1198,27 @@ extern void BTA_DmBleGetEnergyInfo(tBTA_BLE_ENERGY_INFO_CBACK* p_cmpl_cback);
  *
  ******************************************************************************/
 extern void BTA_VendorInit(void);
+
+/*******************************************************************************
+ *
+ * Function         BTA_DmClearEventFilter
+ *
+ * Description      This function clears the event filter
+ *
+ * Returns          void
+ *
+ ******************************************************************************/
+extern void BTA_DmClearEventFilter(void);
+
+/*******************************************************************************
+ *
+ * Function         BTA_DmBleResetId
+ *
+ * Description      This function resets the ble keys such as IRK
+ *
+ * Returns          void
+ *
+ ******************************************************************************/
+extern void BTA_DmBleResetId(void);
 
 #endif /* BTA_API_H */

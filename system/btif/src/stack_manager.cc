@@ -21,17 +21,14 @@
 #include "btif/include/stack_manager.h"
 
 #include <hardware/bluetooth.h>
-#if defined(STATIC_LIBBLUETOOTH)
 #include <cstdlib>
 #include <cstring>
-#endif
 
 #include "btcore/include/module.h"
 #include "btcore/include/osi_module.h"
 #include "btif_api.h"
 #include "btif_common.h"
 #include "common/message_loop_thread.h"
-#include "hci/include/btsnoop.h"
 #include "main/shim/shim.h"
 #include "osi/include/log.h"
 #include "osi/include/osi.h"
@@ -62,27 +59,22 @@
 #if (HID_HOST_INCLUDED == TRUE)
 #include "stack/include/hidh_api.h"
 #endif
-#include "stack/include/smp_api.h"
-#include "bta_ar_api.h"
 #include "bta/sys/bta_sys_int.h"
+#include "bta_ar_api.h"
 #include "bta_dm_int.h"
 #include "btif/include/btif_pan.h"
 #include "btif/include/btif_sock.h"
+#include "btm_ble_int.h"
 #include "device/include/interop.h"
 #include "internal_include/stack_config.h"
 #include "main/shim/controller.h"
+#include "stack/include/smp_api.h"
+
+#ifndef BT_STACK_CLEANUP_WAIT_MS
+#define BT_STACK_CLEANUP_WAIT_MS 1000
+#endif
 
 // Validate or respond to various conditional compilation flags
-
-#if BLE_PRIVACY_SPT != TRUE
-// Once BLE_PRIVACY_SPT is no longer exposed via bt_target.h
-// this check and error statement may be removed.
-#warning \
-    "#define BLE_PRIVACY_SPT FALSE preprocessor compilation flag is unsupported"
-#warning \
-    "  To disable LE privacy for a device use: #define BLE_LOCAL_PRIVACY_ENABLED FALSE"
-#error "*** Conditional Compilation Directive error"
-#endif
 
 #if SDP_RAW_DATA_INCLUDED != TRUE
 // Once SDP_RAW_DATA_INCLUDED is no longer exposed via bt_target.h
@@ -117,6 +109,15 @@ static_assert(
     "  Pan profile always supports user as a client in the bluetooth stack"
     "*** Conditional Compilation Directive error");
 
+// Once BTA_HH_INCLUDED is no longer exposed via bt_target.h
+// this check and error statement may be removed.
+static_assert(
+    BTA_HH_INCLUDED,
+    "#define BTA_HH_INCLUDED preprocessor compilation flag is "
+    "unsupported"
+    "  Host interface device profile is always enabled in the bluetooth stack"
+    "*** Conditional Compilation Directive error");
+
 void main_thread_shut_down();
 void main_thread_start_up();
 void BTA_dm_on_hw_on();
@@ -135,7 +136,7 @@ static bool stack_is_running;
 static void event_init_stack(void* context);
 static void event_start_up_stack(void* context);
 static void event_shut_down_stack(void* context);
-static void event_clean_up_stack(void* context);
+static void event_clean_up_stack(std::promise<void> promise);
 
 static void event_signal_stack_up(void* context);
 static void event_signal_stack_down(void* context);
@@ -172,28 +173,30 @@ static void shut_down_stack_async() {
 static void clean_up_stack() {
   // This is a synchronous process. Post it to the thread though, so
   // state modification only happens there.
-  semaphore_t* semaphore = semaphore_new(0);
-  management_thread.DoInThread(FROM_HERE,
-                               base::Bind(event_clean_up_stack, semaphore));
-  semaphore_wait(semaphore);
-  semaphore_free(semaphore);
-  management_thread.ShutDown();
+  std::promise<void> promise;
+  auto future = promise.get_future();
+  management_thread.DoInThread(
+      FROM_HERE, base::BindOnce(event_clean_up_stack, std::move(promise)));
+
+  auto status =
+      future.wait_for(std::chrono::milliseconds(BT_STACK_CLEANUP_WAIT_MS));
+  if (status == std::future_status::ready) {
+    management_thread.ShutDown();
+  } else {
+    LOG_ERROR("cleanup could not be completed in time, abandon it");
+  }
 }
 
 static bool get_stack_is_running() { return stack_is_running; }
 
 // Internal functions
-
-#ifdef STATIC_LIBBLUETOOTH
 extern const module_t bt_utils_module;
 extern const module_t bte_logmsg_module;
 extern const module_t btif_config_module;
-extern const module_t btsnoop_module;
 extern const module_t bt_utils_module;
 extern const module_t gd_controller_module;
 extern const module_t gd_idle_module;
 extern const module_t gd_shim_module;
-extern const module_t hci_module;
 extern const module_t interop_module;
 extern const module_t osi_module;
 extern const module_t stack_config_module;
@@ -206,7 +209,6 @@ struct module_lookup {
 const struct module_lookup module_table[] = {
     {BTE_LOGMSG_MODULE, &bte_logmsg_module},
     {BTIF_CONFIG_MODULE, &btif_config_module},
-    {BTSNOOP_MODULE, &btsnoop_module},
     {BT_UTILS_MODULE, &bt_utils_module},
     {GD_CONTROLLER_MODULE, &gd_controller_module},
     {GD_IDLE_MODULE, &gd_idle_module},
@@ -229,11 +231,6 @@ inline const module_t* get_local_module(const char* name) {
   LOG_ALWAYS_FATAL("Cannot find module %s, aborting", name);
   return nullptr;
 }
-#else
-inline const module_t* get_local_module(const char* name) {
-  return get_module(name);
-}
-#endif
 
 // Synchronous function to initialize the stack
 static void event_init_stack(void* context) {
@@ -248,9 +245,7 @@ static void event_init_stack(void* context) {
 
     module_init(get_local_module(OSI_MODULE));
     module_init(get_local_module(BT_UTILS_MODULE));
-    if (bluetooth::shim::is_any_gd_enabled()) {
-      module_start_up(get_local_module(GD_IDLE_MODULE));
-    }
+    module_start_up(get_local_module(GD_IDLE_MODULE));
     module_init(get_local_module(BTIF_CONFIG_MODULE));
     btif_init_bluetooth();
 
@@ -289,17 +284,12 @@ static void event_start_up_stack(UNUSED_ATTR void* context) {
   future_t* local_hack_future = future_new();
   hack_future = local_hack_future;
 
-  if (bluetooth::shim::is_any_gd_enabled()) {
-    LOG_INFO("%s Gd shim module enabled", __func__);
-    module_shut_down(get_local_module(GD_IDLE_MODULE));
-    module_start_up(get_local_module(GD_SHIM_MODULE));
-    module_start_up(get_local_module(BTIF_CONFIG_MODULE));
-  } else {
-    module_start_up(get_local_module(BTIF_CONFIG_MODULE));
-    module_start_up(get_local_module(BTSNOOP_MODULE));
-  }
-
+  LOG_INFO("%s Gd shim module enabled", __func__);
+  module_shut_down(get_local_module(GD_IDLE_MODULE));
   get_btm_client_interface().lifecycle.btm_init();
+  module_start_up(get_local_module(GD_SHIM_MODULE));
+  module_start_up(get_local_module(BTIF_CONFIG_MODULE));
+
   l2c_init();
   sdp_init();
   gatt_init();
@@ -363,6 +353,8 @@ static void event_shut_down_stack(UNUSED_ATTR void* context) {
 
   do_in_main_thread(FROM_HERE, base::Bind(&btm_ble_multi_adv_cleanup));
 
+  do_in_main_thread(FROM_HERE, base::Bind(&btm_ble_scanner_cleanup));
+
   btif_dm_on_disable();
   btif_sock_cleanup();
   btif_pan_cleanup();
@@ -389,15 +381,11 @@ static void event_shut_down_stack(UNUSED_ATTR void* context) {
   l2c_free();
   sdp_free();
   get_btm_client_interface().lifecycle.btm_ble_free();
-  get_btm_client_interface().lifecycle.btm_free();
 
-  if (bluetooth::shim::is_any_gd_enabled()) {
-    LOG_INFO("%s Gd shim module disabled", __func__);
-    module_shut_down(get_local_module(GD_SHIM_MODULE));
-    module_start_up(get_local_module(GD_IDLE_MODULE));
-  } else {
-    module_shut_down(get_local_module(BTSNOOP_MODULE));
-  }
+  LOG_INFO("%s Gd shim module disabled", __func__);
+  module_shut_down(get_local_module(GD_SHIM_MODULE));
+  get_btm_client_interface().lifecycle.btm_free();
+  module_start_up(get_local_module(GD_IDLE_MODULE));
 
   hack_future = future_new();
   do_in_jni_thread(FROM_HERE, base::Bind(event_signal_stack_down, nullptr));
@@ -414,7 +402,7 @@ static void ensure_stack_is_not_running() {
 }
 
 // Synchronous function to clean up the stack
-static void event_clean_up_stack(void* context) {
+static void event_clean_up_stack(std::promise<void> promise) {
   if (!stack_is_initialized) {
     LOG_INFO("%s found the stack already in a clean state", __func__);
     goto cleanup;
@@ -438,8 +426,7 @@ static void event_clean_up_stack(void* context) {
   LOG_INFO("%s finished", __func__);
 
 cleanup:;
-  semaphore_t* semaphore = (semaphore_t*)context;
-  if (semaphore) semaphore_post(semaphore);
+  promise.set_value();
 }
 
 static void event_signal_stack_up(UNUSED_ATTR void* context) {

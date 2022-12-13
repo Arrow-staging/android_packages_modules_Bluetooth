@@ -46,6 +46,7 @@ extern std::map<std::string, int> mock_function_count_map;
 #include "stack/include/btm_status.h"
 #include "stack/include/l2cap_security_interface.h"
 #include "stack/smp/smp_int.h"
+#include "test/mock/mock_stack_btm_sec.h"
 #include "types/raw_address.h"
 
 #ifndef UNUSED_ATTR
@@ -146,11 +147,25 @@ tBTM_STATUS BTM_SecBondCancel(const RawAddress& bd_addr) {
   mock_function_count_map[__func__]++;
   return BTM_SUCCESS;
 }
+namespace test {
+namespace mock {
+namespace stack_btm_sec {
+
+struct BTM_SetEncryption BTM_SetEncryption;
+
+}
+}  // namespace mock
+}  // namespace test
+
 tBTM_STATUS BTM_SetEncryption(const RawAddress& bd_addr,
                               tBT_TRANSPORT transport,
                               tBTM_SEC_CALLBACK* p_callback, void* p_ref_data,
                               tBTM_BLE_SEC_ACT sec_act) {
   mock_function_count_map[__func__]++;
+  if (test::mock::stack_btm_sec::BTM_SetEncryption.body) {
+    return test::mock::stack_btm_sec::BTM_SetEncryption.body(
+        bd_addr, transport, p_callback, p_ref_data, sec_act);
+  }
   return BTM_SUCCESS;
 }
 tBTM_STATUS btm_sec_bond_by_transport(const RawAddress& bd_addr,
@@ -160,7 +175,8 @@ tBTM_STATUS btm_sec_bond_by_transport(const RawAddress& bd_addr,
   mock_function_count_map[__func__]++;
   return BTM_SUCCESS;
 }
-tBTM_STATUS btm_sec_disconnect(uint16_t handle, tHCI_STATUS reason) {
+tBTM_STATUS btm_sec_disconnect(uint16_t handle, tHCI_STATUS reason,
+                               std::string comment) {
   mock_function_count_map[__func__]++;
   return BTM_SUCCESS;
 }
@@ -223,22 +239,22 @@ void BTM_SetPinType(uint8_t pin_type, PIN_CODE pin_code, uint8_t pin_code_len) {
 void NotifyBondingCanceled(tBTM_STATUS btm_status) {
   mock_function_count_map[__func__]++;
 }
-void btm_create_conn_cancel_complete(uint8_t* p) {
+void btm_create_conn_cancel_complete(const uint8_t* p) {
   mock_function_count_map[__func__]++;
 }
 void btm_io_capabilities_req(const RawAddress& p) {
   mock_function_count_map[__func__]++;
 }
-void btm_io_capabilities_rsp(uint8_t* p) {
+void btm_io_capabilities_rsp(const uint8_t* p) {
   mock_function_count_map[__func__]++;
 }
-void btm_proc_sp_req_evt(tBTM_SP_EVT event, uint8_t* p) {
+void btm_proc_sp_req_evt(tBTM_SP_EVT event, const uint8_t* p) {
   mock_function_count_map[__func__]++;
 }
 void btm_read_local_oob_complete(uint8_t* p) {
   mock_function_count_map[__func__]++;
 }
-void btm_rem_oob_req(uint8_t* p) { mock_function_count_map[__func__]++; }
+void btm_rem_oob_req(const uint8_t* p) { mock_function_count_map[__func__]++; }
 void btm_sec_abort_access_req(const RawAddress& bd_addr) {
   mock_function_count_map[__func__]++;
 }
@@ -262,7 +278,8 @@ void btm_sec_dev_rec_cback_event(tBTM_SEC_DEV_REC* p_dev_rec,
   mock_function_count_map[__func__]++;
 }
 void btm_sec_dev_reset(void) { mock_function_count_map[__func__]++; }
-void btm_sec_disconnected(uint16_t handle, tHCI_REASON reason) {
+void btm_sec_disconnected(uint16_t handle, tHCI_REASON reason,
+                          std::string comment) {
   mock_function_count_map[__func__]++;
 }
 void btm_sec_encrypt_change(uint16_t handle, tHCI_STATUS status,
@@ -273,17 +290,18 @@ void btm_sec_link_key_notification(const RawAddress& p_bda,
                                    const Octet16& link_key, uint8_t key_type) {
   mock_function_count_map[__func__]++;
 }
-void btm_sec_link_key_request(uint8_t* p_event) {
+void btm_sec_link_key_request(const uint8_t* p_event) {
   mock_function_count_map[__func__]++;
 }
-void btm_sec_pin_code_request(uint8_t* p_event) {
+void btm_sec_pin_code_request(const uint8_t* p_event) {
   mock_function_count_map[__func__]++;
 }
-void btm_sec_rmt_host_support_feat_evt(uint8_t* p) {
+void btm_sec_rmt_host_support_feat_evt(const uint8_t* p) {
   mock_function_count_map[__func__]++;
 }
 void btm_sec_rmt_name_request_complete(const RawAddress* p_bd_addr,
-                                       uint8_t* p_bd_name, tHCI_STATUS status) {
+                                       const uint8_t* p_bd_name,
+                                       tHCI_STATUS status) {
   mock_function_count_map[__func__]++;
 }
 void btm_sec_set_peer_sec_caps(uint16_t hci_handle, bool ssp_supported,
@@ -295,6 +313,6 @@ void btm_sec_set_peer_sec_caps(uint16_t hci_handle, bool ssp_supported,
 void btm_sec_update_clock_offset(uint16_t handle, uint16_t clock_offset) {
   mock_function_count_map[__func__]++;
 }
-void btm_simple_pair_complete(uint8_t* p) {
+void btm_simple_pair_complete(const uint8_t* p) {
   mock_function_count_map[__func__]++;
 }

@@ -63,6 +63,11 @@ class LeAclConnectionTracker : public LeConnectionManagementCallbacks {
         connection_handle_, static_cast<uint8_t>(hci_status), lmp_version, manufacturer_name, sub_version);
     SAVE_OR_CALL(OnReadRemoteVersionInformationComplete, hci_status, lmp_version, manufacturer_name, sub_version);
   }
+
+  void OnLeReadRemoteFeaturesComplete(hci::ErrorCode hci_status, uint64_t features) override {
+    SAVE_OR_CALL(OnLeReadRemoteFeaturesComplete, hci_status, features);
+  }
+
   void OnPhyUpdate(hci::ErrorCode hci_status, uint8_t tx_phy, uint8_t rx_phy) override {
     SAVE_OR_CALL(OnPhyUpdate, hci_status, tx_phy, rx_phy);
   }
@@ -85,15 +90,17 @@ class LeAclConnectionTracker : public LeConnectionManagementCallbacks {
 struct LeAclConnection::impl {
   impl(LeAclConnectionInterface* le_acl_connection_interface, std::shared_ptr<Queue> queue, uint16_t connection_handle)
       : queue_(std::move(queue)), tracker(le_acl_connection_interface, connection_handle) {}
-  LeConnectionManagementCallbacks* GetEventCallbacks() {
-    ASSERT(!callbacks_given_);
-    callbacks_given_ = true;
+  LeConnectionManagementCallbacks* GetEventCallbacks(std::function<void(uint16_t)> invalidate_callbacks) {
+    ASSERT_LOG(!invalidate_callbacks_, "Already returned event callbacks for this connection");
+    invalidate_callbacks_ = std::move(invalidate_callbacks);
     return &tracker;
   }
-
-  bool callbacks_given_{false};
+  void PutEventCallbacks() {
+    if (invalidate_callbacks_) invalidate_callbacks_(tracker.connection_handle_);
+  }
   std::shared_ptr<Queue> queue_;
   LeAclConnectionTracker tracker;
+  std::function<void(uint16_t)> invalidate_callbacks_;
 };
 
 LeAclConnection::LeAclConnection()
@@ -115,6 +122,7 @@ LeAclConnection::LeAclConnection(
 }
 
 LeAclConnection::~LeAclConnection() {
+  if (pimpl_) pimpl_->PutEventCallbacks();
   delete pimpl_;
 }
 
@@ -137,8 +145,9 @@ void LeAclConnection::Disconnect(DisconnectReason reason) {
       }));
 }
 
-LeConnectionManagementCallbacks* LeAclConnection::GetEventCallbacks() {
-  return pimpl_->GetEventCallbacks();
+LeConnectionManagementCallbacks* LeAclConnection::GetEventCallbacks(
+    std::function<void(uint16_t)> invalidate_callbacks) {
+  return pimpl_->GetEventCallbacks(std::move(invalidate_callbacks));
 }
 
 bool LeAclConnection::LeConnectionUpdate(uint16_t conn_interval_min, uint16_t conn_interval_max, uint16_t conn_latency,
@@ -163,6 +172,16 @@ bool LeAclConnection::ReadRemoteVersionInformation() {
       pimpl_->tracker.client_handler_->BindOnce([](CommandStatusView status) {
         ASSERT(status.IsValid());
         ASSERT(status.GetCommandOpCode() == OpCode::READ_REMOTE_VERSION_INFORMATION);
+      }));
+  return true;
+}
+
+bool LeAclConnection::LeReadRemoteFeatures() {
+  pimpl_->tracker.le_acl_connection_interface_->EnqueueCommand(
+      LeReadRemoteFeaturesBuilder::Create(handle_),
+      pimpl_->tracker.client_handler_->BindOnce([](CommandStatusView status) {
+        ASSERT(status.IsValid());
+        ASSERT(status.GetCommandOpCode() == OpCode::LE_READ_REMOTE_FEATURES);
       }));
   return true;
 }

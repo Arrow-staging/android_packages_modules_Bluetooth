@@ -24,9 +24,14 @@
 
 #include <vector>
 
+class LeAudioUnicastClientAudioSource;
+class LeAudioUnicastClientAudioSink;
+
 class LeAudioHalVerifier {
  public:
   static bool SupportsLeAudio();
+  static bool SupportsLeAudioHardwareOffload();
+  static bool SupportsLeAudioBroadcast();
 };
 
 /* Interface class */
@@ -34,11 +39,16 @@ class LeAudioClient {
  public:
   virtual ~LeAudioClient(void) = default;
 
-  static void Initialize(bluetooth::le_audio::LeAudioClientCallbacks* callbacks,
-                         base::Closure initCb,
-                         base::Callback<bool()> hal_2_1_verifier);
-  static void Cleanup(void);
+  static void Initialize(
+      bluetooth::le_audio::LeAudioClientCallbacks* callbacks,
+      base::Closure initCb, base::Callback<bool()> hal_2_1_verifier,
+      const std::vector<bluetooth::le_audio::btle_audio_codec_config_t>&
+          offloading_preference);
+  static void Cleanup(base::Callback<void()> cleanupCb);
   static LeAudioClient* Get(void);
+  static void InitializeAudioClients(
+      LeAudioUnicastClientAudioSource* clientAudioSource,
+      LeAudioUnicastClientAudioSink* clientAudioSink);
   static void DebugDump(int fd);
 
   virtual void RemoveDevice(const RawAddress& address) = 0;
@@ -51,7 +61,32 @@ class LeAudioClient {
   virtual void GroupStop(const int group_id) = 0;
   virtual void GroupDestroy(const int group_id) = 0;
   virtual void GroupSetActive(const int group_id) = 0;
+  virtual void SetCodecConfigPreference(
+      int group_id,
+      bluetooth::le_audio::btle_audio_codec_config_t input_codec_config,
+      bluetooth::le_audio::btle_audio_codec_config_t output_codec_config) = 0;
+  virtual void SetCcidInformation(int ccid, int context_type) = 0;
+  virtual void SetInCall(bool in_call) = 0;
+
   virtual std::vector<RawAddress> GetGroupDevices(const int group_id) = 0;
-  static void AddFromStorage(const RawAddress& addr, bool autoconnect);
+  static void AddFromStorage(const RawAddress& addr, bool autoconnect,
+                             int sink_audio_location, int source_audio_location,
+                             int sink_supported_context_types,
+                             int source_supported_context_types,
+                             const std::vector<uint8_t>& handles,
+                             const std::vector<uint8_t>& sink_pacs,
+                             const std::vector<uint8_t>& source_pacs,
+                             const std::vector<uint8_t>& ases);
+  static bool GetHandlesForStorage(const RawAddress& addr,
+                                   std::vector<uint8_t>& out);
+  static bool GetSinkPacsForStorage(const RawAddress& addr,
+                                    std::vector<uint8_t>& out);
+  static bool GetSourcePacsForStorage(const RawAddress& addr,
+                                      std::vector<uint8_t>& out);
+  static bool GetAsesForStorage(const RawAddress& addr,
+                                std::vector<uint8_t>& out);
   static bool IsLeAudioClientRunning();
+
+  static void InitializeAudioSetConfigurationProvider(void);
+  static void CleanupAudioSetConfigurationProvider(void);
 };

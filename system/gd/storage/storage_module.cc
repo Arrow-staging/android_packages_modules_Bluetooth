@@ -23,6 +23,7 @@
 #include <utility>
 
 #include "common/bind.h"
+#include "metrics/counter_metrics.h"
 #include "os/alarm.h"
 #include "os/files.h"
 #include "os/handler.h"
@@ -148,15 +149,17 @@ void StorageModule::SaveImmediately() {
 }
 
 void StorageModule::ListDependencies(ModuleList* list) const {
-  // No dependencies
+    list->add<metrics::CounterMetrics>();
 }
 
 void StorageModule::Start() {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   std::string file_source;
   if (os::GetSystemProperty(kFactoryResetProperty) == "true") {
+    LOG_INFO("%s is true, delete config files", kFactoryResetProperty.c_str());
     LegacyConfigFile::FromPath(config_file_path_).Delete();
     LegacyConfigFile::FromPath(config_backup_path_).Delete();
+    os::SetSystemProperty(kFactoryResetProperty, "false");
   }
   if (!is_config_checksum_pass(kConfigFileComparePass)) {
     LegacyConfigFile::FromPath(config_file_path_).Delete();

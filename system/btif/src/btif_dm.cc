@@ -29,6 +29,10 @@
 
 #include "btif_dm.h"
 
+#ifdef OS_ANDROID
+#include <android/sysprop/BluetoothProperties.sysprop.h>
+#endif
+
 #include <base/bind.h>
 #include <base/logging.h>
 #include <bluetooth/uuid.h>
@@ -46,6 +50,10 @@
 #include <unistd.h>
 
 #include <mutex>
+
+#ifdef OS_ANDROID
+#include <android/sysprop/BluetoothProperties.sysprop.h>
+#endif
 
 #include "advertise_data_parser.h"
 #include "bta_csis_api.h"
@@ -70,7 +78,9 @@
 #include "common/metrics.h"
 #include "device/include/controller.h"
 #include "device/include/interop.h"
+#include "gd/common/lru_cache.h"
 #include "internal_include/stack_config.h"
+#include "main/shim/dumpsys.h"
 #include "main/shim/shim.h"
 #include "osi/include/allocator.h"
 #include "osi/include/log.h"
@@ -82,6 +92,8 @@
 #include "stack_config.h"
 #include "types/raw_address.h"
 
+bool btif_get_device_type(const RawAddress& bda, int* p_device_type);
+
 using bluetooth::Uuid;
 /******************************************************************************
  *  Constants & Macros
@@ -91,6 +103,11 @@ const Uuid UUID_HEARING_AID = Uuid::FromString("FDF0");
 const Uuid UUID_VC = Uuid::FromString("1844");
 const Uuid UUID_CSIS = Uuid::FromString("1846");
 const Uuid UUID_LE_AUDIO = Uuid::FromString("184E");
+const Uuid UUID_LE_MIDI = Uuid::FromString("03B80E5A-EDE8-4B33-A751-6CE34EC4C700");
+const Uuid UUID_HAS = Uuid::FromString("1854");
+const Uuid UUID_BASS = Uuid::FromString("184F");
+const Uuid UUID_BATTERY = Uuid::FromString("180F");
+const bool enable_address_consolidate = true;  // TODO remove
 
 #define COD_MASK 0x07FF
 
@@ -108,13 +125,24 @@ const Uuid UUID_LE_AUDIO = Uuid::FromString("184E");
 
 #define BTIF_DM_MAX_SDP_ATTEMPTS_AFTER_PAIRING 2
 
+#ifndef PROPERTY_CLASS_OF_DEVICE
+#define PROPERTY_CLASS_OF_DEVICE "bluetooth.device.class_of_device"
+#endif
+
 #define NUM_TIMEOUT_RETRIES 5
+#ifndef PROPERTY_DEFAULT_DEVICE_NAME
+#define PROPERTY_DEFAULT_DEVICE_NAME "bluetooth.device.default_name"
+#endif
 #ifndef PROPERTY_PRODUCT_MODEL
 #define PROPERTY_PRODUCT_MODEL "ro.product.model"
 #endif
 #define DEFAULT_LOCAL_NAME_MAX 31
 #if (DEFAULT_LOCAL_NAME_MAX > BTM_MAX_LOC_BD_NAME_LEN)
 #error "default btif local name size exceeds stack supported length"
+#endif
+
+#ifndef PROPERTY_BLE_PRIVACY_ENABLED
+#define PROPERTY_BLE_PRIVACY_ENABLED "bluetooth.core.gap.le.privacy.enabled"
 #endif
 
 #define ENCRYPTED_BREDR 2
@@ -184,6 +212,11 @@ typedef struct {
 
 #define MAX_BTIF_BOND_EVENT_ENTRIES 15
 
+#define MAX_NUM_DEVICES_IN_EIR_UUID_CACHE 128
+
+static bluetooth::common::LruCache<RawAddress, std::set<Uuid>> eir_uuids_cache(
+    MAX_NUM_DEVICES_IN_EIR_UUID_CACHE);
+
 static skip_sdp_entry_t sdp_rejectlist[] = {{76}};  // Apple Mouse and Keyboard
 
 /* This flag will be true if HCI_Inquiry is in progress */
@@ -228,11 +261,7 @@ static void btif_dm_ble_key_nc_req_evt(tBTA_DM_SP_KEY_NOTIF* p_notif_req);
 static void btif_dm_ble_oob_req_evt(tBTA_DM_SP_RMT_OOB* req_oob_type);
 static void btif_dm_ble_sc_oob_req_evt(tBTA_DM_SP_RMT_OOB* req_oob_type);
 
-static void bte_scan_filt_param_cfg_evt(uint8_t avbl_space,
-                                        tBTM_BLE_SCAN_COND_OP action_type,
-                                        tBTM_STATUS btm_status);
-
-static char* btif_get_default_local_name();
+static const char* btif_get_default_local_name();
 
 static void btif_stats_add_bond_event(const RawAddress& bd_addr,
                                       bt_bond_function_t function,
@@ -963,9 +992,14 @@ static void btif_dm_auth_cmpl_evt(tBTA_DM_AUTH_CMPL* p_auth_cmpl) {
         bt_status_t ret;
         BTIF_TRACE_DEBUG("%s: Storing link key. key_type=0x%x, bond_type=%d",
                          __func__, p_auth_cmpl->key_type, pairing_cb.bond_type);
-        ret = btif_storage_add_bonded_device(&bd_addr, p_auth_cmpl->key,
-                                             p_auth_cmpl->key_type,
-                                             pairing_cb.pin_code_len);
+        if (!bd_addr.IsEmpty()) {
+          ret = btif_storage_add_bonded_device(&bd_addr, p_auth_cmpl->key,
+                                               p_auth_cmpl->key_type,
+                                               pairing_cb.pin_code_len);
+        } else {
+          LOG_WARN("bd_addr is empty");
+          ret = BT_STATUS_FAIL;
+        }
         ASSERTC(ret == BT_STATUS_SUCCESS, "storing link key failed", ret);
       } else {
         BTIF_TRACE_DEBUG(
@@ -1008,8 +1042,19 @@ static void btif_dm_auth_cmpl_evt(tBTA_DM_AUTH_CMPL* p_auth_cmpl) {
     } else {
       dev_type = p_auth_cmpl->dev_type;
     }
-    btif_update_remote_properties(p_auth_cmpl->bd_addr, p_auth_cmpl->bd_name,
-                                  NULL, dev_type);
+
+    bool is_crosskey = false;
+    if (pairing_cb.state == BT_BOND_STATE_BONDING &&
+        p_auth_cmpl->bd_addr != pairing_cb.bd_addr) {
+      LOG_INFO("bonding initiated due to cross key pairing");
+      is_crosskey = true;
+    }
+
+    if (!is_crosskey || !enable_address_consolidate) {
+      btif_update_remote_properties(p_auth_cmpl->bd_addr, p_auth_cmpl->bd_name,
+                                    NULL, dev_type);
+    }
+
     pairing_cb.timeout_retries = 0;
     status = BT_STATUS_SUCCESS;
     state = BT_BOND_STATE_BONDED;
@@ -1032,7 +1077,6 @@ static void btif_dm_auth_cmpl_evt(tBTA_DM_AUTH_CMPL* p_auth_cmpl) {
 
       invoke_remote_device_properties_cb(BT_STATUS_SUCCESS, bd_addr, 1, &prop);
     } else {
-      bool is_crosskey = false;
       /* If bonded due to cross-key, save the static address too*/
       if (pairing_cb.state == BT_BOND_STATE_BONDING &&
           p_auth_cmpl->bd_addr != pairing_cb.bd_addr) {
@@ -1040,7 +1084,6 @@ static void btif_dm_auth_cmpl_evt(tBTA_DM_AUTH_CMPL* p_auth_cmpl) {
             "%s: bonding initiated due to cross key, adding static address",
             __func__);
         pairing_cb.static_bdaddr = bd_addr;
-        is_crosskey = true;
       }
       if (!is_crosskey ||
           !(stack_config_get_interface()->get_pts_crosskey_sdp_disable())) {
@@ -1050,15 +1093,17 @@ static void btif_dm_auth_cmpl_evt(tBTA_DM_AUTH_CMPL* p_auth_cmpl) {
         /* Trigger SDP on the device */
         pairing_cb.sdp_attempts = 1;
 
-        if (is_crosskey) {
-          // If bonding occurred due to cross-key pairing, send bonding callback
-          // for static address now
-          LOG_INFO("%s: send bonding state update for static address %s",
-                   __func__, bd_addr.ToString().c_str());
+        if (is_crosskey && enable_address_consolidate) {
+          // If bonding occurred due to cross-key pairing, send address
+          // consolidate callback
+          invoke_address_consolidate_cb(pairing_cb.bd_addr, bd_addr);
+        } else if (is_crosskey && !enable_address_consolidate) {
+          // TODO remove
           bond_state_changed(BT_STATUS_SUCCESS, bd_addr, BT_BOND_STATE_BONDING);
+          bond_state_changed(BT_STATUS_SUCCESS, bd_addr, BT_BOND_STATE_BONDED);
+        } else {
+          bond_state_changed(BT_STATUS_SUCCESS, bd_addr, BT_BOND_STATE_BONDED);
         }
-        bond_state_changed(BT_STATUS_SUCCESS, bd_addr, BT_BOND_STATE_BONDED);
-
         btif_dm_get_remote_services(bd_addr, BT_TRANSPORT_AUTO);
       }
     }
@@ -1084,22 +1129,14 @@ static void btif_dm_auth_cmpl_evt(tBTA_DM_AUTH_CMPL* p_auth_cmpl) {
         break;
 
       case HCI_ERR_PAIRING_NOT_ALLOWED:
-        if (!bluetooth::shim::is_gd_security_enabled()) {
-          is_bonded_device_removed = (btif_storage_remove_bonded_device(
-                                          &bd_addr) == BT_STATUS_SUCCESS);
-        } else {
-          is_bonded_device_removed = true;
-        }
+        is_bonded_device_removed = false;
         status = BT_STATUS_AUTH_REJECTED;
         break;
 
       /* map the auth failure codes, so we can retry pairing if necessary */
       case HCI_ERR_AUTH_FAILURE:
       case HCI_ERR_KEY_MISSING:
-        is_bonded_device_removed = (bluetooth::shim::is_gd_security_enabled())
-                                       ? true
-                                       : (btif_storage_remove_bonded_device(
-                                              &bd_addr) == BT_STATUS_SUCCESS);
+        is_bonded_device_removed = false;
         [[fallthrough]];
       case HCI_ERR_HOST_REJECT_SECURITY:
       case HCI_ERR_ENCRY_MODE_NOT_ACCEPTABLE:
@@ -1130,10 +1167,7 @@ static void btif_dm_auth_cmpl_evt(tBTA_DM_AUTH_CMPL* p_auth_cmpl) {
       /* Remove Device as bonded in nvram as authentication failed */
       BTIF_TRACE_DEBUG("%s(): removing hid pointing device from nvram",
                        __func__);
-      is_bonded_device_removed = (bluetooth::shim::is_gd_security_enabled())
-                                     ? true
-                                     : (btif_storage_remove_bonded_device(
-                                            &bd_addr) == BT_STATUS_SUCCESS);
+      is_bonded_device_removed = false;
     }
     // Report bond state change to java only if we are bonding to a device or
     // a device is removed from the pairing list.
@@ -1268,19 +1302,20 @@ static void btif_dm_search_devices_evt(tBTA_DM_SEARCH_EVT event,
                                    &(p_search_data->inq_res.include_rsi));
         num_properties++;
 
-        /* EIR queried services */
-        std::vector<Uuid> uuid128_list;
+        /* Cache EIR queried services */
         if (num_uuids > 0) {
           uint16_t* p_uuid16 = (uint16_t*)uuid_list;
+          auto uuid_iter = eir_uuids_cache.find(bdaddr);
+          if (uuid_iter == eir_uuids_cache.end()) {
+            auto triple = eir_uuids_cache.try_emplace(bdaddr, std::set<Uuid>{});
+            uuid_iter = std::get<0>(triple);
+          }
+          LOG_INFO("EIR UUIDs for %s:", bdaddr.ToString().c_str());
           for (int i = 0; i < num_uuids; ++i) {
             Uuid uuid = Uuid::From16Bit(p_uuid16[i]);
-            uuid128_list.push_back(uuid);
+            LOG_INFO("        %s", uuid.ToString().c_str());
+            uuid_iter->second.insert(uuid);
           }
-
-          BTIF_STORAGE_FILL_PROPERTY(
-              &properties[num_properties], BT_PROPERTY_UUIDS,
-              num_uuids * Uuid::kNumBytes128, uuid128_list.data());
-          num_properties++;
         }
 
         status =
@@ -1296,9 +1331,7 @@ static void btif_dm_search_devices_evt(tBTA_DM_SEARCH_EVT event,
     } break;
 
     case BTA_DM_INQ_CMPL_EVT: {
-      BTM_BleAdvFilterParamSetup(
-          BTM_BLE_SCAN_COND_DELETE, static_cast<tBTM_BLE_PF_FILT_INDEX>(0),
-          nullptr, base::Bind(&bte_scan_filt_param_cfg_evt));
+      /* do nothing */
     } break;
     case BTA_DM_DISC_CMPL_EVT: {
       invoke_discovery_state_changed_cb(BT_DISCOVERY_STOPPED);
@@ -1314,10 +1347,6 @@ static void btif_dm_search_devices_evt(tBTA_DM_SEARCH_EVT event,
        *
        */
       if (!btif_dm_inquiry_in_progress) {
-        btgatt_filt_param_setup_t adv_filt_param;
-        memset(&adv_filt_param, 0, sizeof(btgatt_filt_param_setup_t));
-        BTM_BleAdvFilterParamSetup(BTM_BLE_SCAN_COND_DELETE, 0, nullptr,
-                                   base::Bind(&bte_scan_filt_param_cfg_evt));
         invoke_discovery_state_changed_cb(BT_DISCOVERY_STOPPED);
       }
     } break;
@@ -1327,7 +1356,21 @@ static void btif_dm_search_devices_evt(tBTA_DM_SEARCH_EVT event,
 /* Returns true if |uuid| should be passed as device property */
 static bool btif_is_interesting_le_service(bluetooth::Uuid uuid) {
   return (uuid.As16Bit() == UUID_SERVCLASS_LE_HID || uuid == UUID_HEARING_AID ||
-          uuid == UUID_VC || uuid == UUID_CSIS || uuid == UUID_LE_AUDIO);
+          uuid == UUID_VC || uuid == UUID_CSIS || uuid == UUID_LE_AUDIO ||
+          uuid == UUID_LE_MIDI || uuid == UUID_HAS || uuid == UUID_BASS ||
+          uuid == UUID_BATTERY);
+}
+
+static void btif_get_existing_uuids(RawAddress* bd_addr, Uuid* existing_uuids) {
+  bt_property_t tmp_prop;
+  BTIF_STORAGE_FILL_PROPERTY(&tmp_prop, BT_PROPERTY_UUIDS,
+                             sizeof(existing_uuids), existing_uuids);
+
+  btif_storage_get_remote_device_property(bd_addr, &tmp_prop);
+}
+
+static bool btif_should_ignore_uuid(const Uuid& uuid) {
+  return uuid.IsEmpty() || uuid.IsBase();
 }
 
 /*******************************************************************************
@@ -1346,6 +1389,8 @@ static void btif_dm_search_services_evt(tBTA_DM_SEARCH_EVT event,
       bt_property_t prop;
       uint32_t i = 0;
       bt_status_t ret;
+      std::vector<uint8_t> property_value;
+      std::set<Uuid> uuids;
 
       RawAddress& bd_addr = p_data->disc_res.bd_addr;
 
@@ -1367,48 +1412,81 @@ static void btif_dm_search_services_evt(tBTA_DM_SEARCH_EVT event,
       prop.len = 0;
       if ((p_data->disc_res.result == BTA_SUCCESS) &&
           (p_data->disc_res.num_uuids > 0)) {
-        prop.val = p_data->disc_res.p_uuid_list;
-        prop.len = p_data->disc_res.num_uuids * Uuid::kNumBytes128;
+        LOG_INFO("New UUIDs for %s:", bd_addr.ToString().c_str());
         for (i = 0; i < p_data->disc_res.num_uuids; i++) {
-          std::string temp = ((p_data->disc_res.p_uuid_list + i))->ToString();
-          LOG_INFO("index:%d uuid:%s", i, temp.c_str());
+          auto uuid = p_data->disc_res.p_uuid_list + i;
+          if (btif_should_ignore_uuid(*uuid)) {
+            continue;
+          }
+          LOG_INFO("index:%d uuid:%s", i, uuid->ToString().c_str());
+          uuids.insert(*uuid);
         }
+
+        Uuid existing_uuids[BT_MAX_NUM_UUIDS] = {};
+        btif_get_existing_uuids(&bd_addr, existing_uuids);
+
+        for (int i = 0; i < BT_MAX_NUM_UUIDS; i++) {
+          Uuid uuid = existing_uuids[i];
+          if (btif_should_ignore_uuid(uuid)) {
+            continue;
+          }
+          if (btif_is_interesting_le_service(uuid)) {
+            LOG_INFO("interesting le service %s insert",
+                     uuid.ToString().c_str());
+            uuids.insert(uuid);
+          }
+        }
+        for (auto& uuid : uuids) {
+          auto uuid_128bit = uuid.To128BitBE();
+          property_value.insert(property_value.end(), uuid_128bit.begin(),
+                                uuid_128bit.end());
+        }
+        prop.val = (void*)property_value.data();
+        prop.len = Uuid::kNumBytes128 * uuids.size();
       }
 
       /* onUuidChanged requires getBondedDevices to be populated.
       ** bond_state_changed needs to be sent prior to remote_device_property
       */
+      auto num_eir_uuids = 0;
+      Uuid uuid = {};
       if (pairing_cb.state == BT_BOND_STATE_BONDED && pairing_cb.sdp_attempts &&
           (p_data->disc_res.bd_addr == pairing_cb.bd_addr ||
            p_data->disc_res.bd_addr == pairing_cb.static_bdaddr)) {
         LOG_INFO("SDP search done for %s", bd_addr.ToString().c_str());
         pairing_cb.sdp_attempts = 0;
 
+        // Send UUIDs discovered through EIR to Java to unblock pairing intent
+        // when SDP failed or no UUID is discovered
+        if (p_data->disc_res.result != BTA_SUCCESS ||
+            p_data->disc_res.num_uuids == 0) {
+          auto uuids_iter = eir_uuids_cache.find(bd_addr);
+          if (uuids_iter != eir_uuids_cache.end()) {
+            num_eir_uuids = static_cast<int>(uuids_iter->second.size());
+            LOG_INFO("SDP failed, send %d EIR UUIDs to unblock bonding %s",
+                     num_eir_uuids, bd_addr.ToString().c_str());
+            for (auto eir_uuid : uuids_iter->second) {
+              auto uuid_128bit = eir_uuid.To128BitBE();
+              property_value.insert(property_value.end(), uuid_128bit.begin(),
+                                    uuid_128bit.end());
+            }
+            eir_uuids_cache.erase(uuids_iter);
+          }
+          if (num_eir_uuids > 0) {
+            prop.val = (void*)property_value.data();
+            prop.len = num_eir_uuids * Uuid::kNumBytes128;
+          } else {
+            LOG_WARN("SDP failed and we have no EIR UUIDs to report either");
+            prop.val = &uuid;
+            prop.len = Uuid::kNumBytes128;
+          }
+        }
         // Both SDP and bonding are done, clear pairing control block in case
         // it is not already cleared
         pairing_cb = {};
-
-        // Send one empty UUID to Java to unblock pairing intent when SDP failed
-        // or no UUID is discovered
-        if (p_data->disc_res.result != BTA_SUCCESS ||
-            p_data->disc_res.num_uuids == 0) {
-          LOG_INFO("SDP failed, send empty UUID to unblock bonding %s",
-                   bd_addr.ToString().c_str());
-          bt_property_t prop_uuids;
-          Uuid uuid = {};
-
-          prop_uuids.type = BT_PROPERTY_UUIDS;
-          prop_uuids.val = &uuid;
-          prop_uuids.len = Uuid::kNumBytes128;
-
-          /* Send the event to the BTIF */
-          invoke_remote_device_properties_cb(BT_STATUS_SUCCESS, bd_addr, 1,
-                                             &prop_uuids);
-          break;
-        }
       }
 
-      if (p_data->disc_res.num_uuids != 0) {
+      if (p_data->disc_res.num_uuids != 0 || num_eir_uuids != 0) {
         /* Also write this to the NVRAM */
         ret = btif_storage_set_remote_device_property(&bd_addr, &prop);
         ASSERTC(ret == BT_STATUS_SUCCESS, "storing remote services failed",
@@ -1431,27 +1509,45 @@ static void btif_dm_search_services_evt(tBTA_DM_SEARCH_EVT event,
       int num_properties = 0;
       bt_property_t prop[2];
       std::vector<uint8_t> property_value;
-      int num_uuids = 0;
+      std::set<Uuid> uuids;
+      RawAddress& bd_addr = p_data->disc_ble_res.bd_addr;
 
+      LOG_INFO("New BLE UUIDs for %s:", bd_addr.ToString().c_str());
       for (Uuid uuid : *p_data->disc_ble_res.services) {
-        LOG_VERBOSE("service %s", uuid.ToString().c_str());
         if (btif_is_interesting_le_service(uuid)) {
-          num_uuids++;
-          auto valAsBe = uuid.To128BitBE();
-          property_value.insert(property_value.end(), valAsBe.begin(),
-                                valAsBe.end());
+          if (btif_should_ignore_uuid(uuid)) {
+            continue;
+          }
+          LOG_INFO("index:%d uuid:%s", static_cast<int>(uuids.size()),
+                   uuid.ToString().c_str());
+          uuids.insert(uuid);
         }
       }
 
-      if (num_uuids == 0) {
+      if (uuids.empty()) {
         LOG_INFO("No well known BLE services discovered");
         return;
       }
 
-      RawAddress& bd_addr = p_data->disc_ble_res.bd_addr;
+      Uuid existing_uuids[BT_MAX_NUM_UUIDS] = {};
+      btif_get_existing_uuids(&bd_addr, existing_uuids);
+      for (int i = 0; i < BT_MAX_NUM_UUIDS; i++) {
+        Uuid uuid = existing_uuids[i];
+        if (uuid.IsEmpty()) {
+          continue;
+        }
+        uuids.insert(uuid);
+      }
+
+      for (auto& uuid : uuids) {
+        auto uuid_128bit = uuid.To128BitBE();
+        property_value.insert(property_value.end(), uuid_128bit.begin(),
+                              uuid_128bit.end());
+      }
+
       prop[0].type = BT_PROPERTY_UUIDS;
       prop[0].val = (void*)property_value.data();
-      prop[0].len = Uuid::kNumBytes128 * num_uuids;
+      prop[0].len = Uuid::kNumBytes128 * uuids.size();
 
       /* Also write this to the NVRAM */
       bt_status_t ret =
@@ -1512,7 +1608,7 @@ void BTIF_dm_enable() {
   status = btif_storage_get_adapter_property(&prop);
   if (status == BT_STATUS_SUCCESS) {
     /* A name exists in the storage. Make this the device name */
-    BTA_DmSetDeviceName((char*)prop.val);
+    BTA_DmSetDeviceName((const char*)prop.val);
   } else {
     /* Storage does not have a name yet.
      * Use the default name and write it to the chip
@@ -1520,8 +1616,22 @@ void BTIF_dm_enable() {
     BTA_DmSetDeviceName(btif_get_default_local_name());
   }
 
-  /* Enable local privacy */
-  BTA_DmBleConfigLocalPrivacy(BLE_LOCAL_PRIVACY_ENABLED);
+  /* Enable or disable local privacy */
+  bool ble_privacy_enabled = true;
+#ifdef OS_ANDROID
+  ble_privacy_enabled =
+      android::sysprop::BluetoothProperties::isGapLePrivacyEnabled().value_or(
+          true);
+#else
+  char ble_privacy_text[PROPERTY_VALUE_MAX] = "true";  // default is enabled
+  if (osi_property_get(PROPERTY_BLE_PRIVACY_ENABLED, ble_privacy_text,
+                       "true") &&
+      !strcmp(ble_privacy_text, "false")) {
+    ble_privacy_enabled = false;
+  }
+#endif
+  LOG_INFO("%s BLE Privacy: %d", __func__, ble_privacy_enabled);
+  BTA_DmBleConfigLocalPrivacy(ble_privacy_enabled);
 
   /* for each of the enabled services in the mask, trigger the profile
    * enable */
@@ -1532,8 +1642,12 @@ void BTIF_dm_enable() {
     }
   }
   /* clear control blocks */
-  memset(&pairing_cb, 0, sizeof(btif_dm_pairing_cb_t));
+  pairing_cb = {};
   pairing_cb.bond_type = tBTM_SEC_DEV_REC::BOND_TYPE_PERSISTENT;
+  if (enable_address_consolidate) {
+    LOG_INFO("enable address consolidate");
+    btif_storage_load_le_devices();
+  }
 
   /* This function will also trigger the adapter_properties_cb
   ** and bonded_devices_info_cb
@@ -1782,6 +1896,19 @@ static void btif_dm_upstreams_evt(uint16_t event, char* p_param) {
     case BTA_DM_LE_FEATURES_READ:
       btif_get_adapter_property(BT_PROPERTY_LOCAL_LE_FEATURES);
       break;
+    /* add case for HANDLE_KEY_MISSING */
+    case BTA_DM_REPORT_BONDING_EVT:
+      LOG_WARN("Received encryption failed: Report bonding firstly.");
+      bd_addr = p_data->delete_key_RC_to_unpair.bd_addr;
+      invoke_bond_state_changed_cb(BT_STATUS_SUCCESS, bd_addr, BT_BOND_STATE_BONDING,
+                                   pairing_cb.fail_reason);
+      btif_dm_remove_bond(bd_addr);
+      break;
+
+    case BTA_DM_LE_ADDR_ASSOC_EVT:
+      invoke_le_address_associate_cb(p_data->proc_id_addr.pairing_bda,
+                                     p_data->proc_id_addr.id_addr);
+      break;
 
     default:
       BTIF_TRACE_WARNING("%s: unhandled event (%d)", __func__, event);
@@ -1835,19 +1962,6 @@ static void bta_energy_info_cb(tBTM_BLE_TX_TIME_MS tx_time,
   invoke_energy_info_cb(energy_info, data);
 }
 
-/* Scan filter param config event */
-static void bte_scan_filt_param_cfg_evt(uint8_t avbl_space, uint8_t action_type,
-                                        tBTM_STATUS btm_status) {
-  /* This event occurs on calling BTA_DmBleCfgFilterCondition internally,
-  ** and that is why there is no HAL callback
-  */
-  if (btm_status != btm_status_value(BTM_SUCCESS)) {
-    BTIF_TRACE_ERROR("%s, %d", __func__, btm_status);
-  } else {
-    BTIF_TRACE_DEBUG("%s", __func__);
-  }
-}
-
 /*****************************************************************************
  *
  *   btif api functions (no context switch)
@@ -1864,33 +1978,17 @@ static void bte_scan_filt_param_cfg_evt(uint8_t avbl_space, uint8_t action_type,
 void btif_dm_start_discovery(void) {
   BTIF_TRACE_EVENT("%s", __func__);
 
+  /* no race here because we're guaranteed to be in the main thread */
   if (bta_dm_is_search_request_queued()) {
     LOG_INFO("%s skipping start discovery because a request is queued",
              __func__);
     return;
   }
 
-  /* Cleanup anything remaining on index 0 */
-  BTM_BleAdvFilterParamSetup(BTM_BLE_SCAN_COND_DELETE,
-                             static_cast<tBTM_BLE_PF_FILT_INDEX>(0), nullptr,
-                             base::Bind(&bte_scan_filt_param_cfg_evt));
-
-  auto adv_filt_param = std::make_unique<btgatt_filt_param_setup_t>();
-  /* Add an allow-all filter on index 0*/
-  adv_filt_param->dely_mode = IMMEDIATE_DELY_MODE;
-  adv_filt_param->feat_seln = ALLOW_ALL_FILTER;
-  adv_filt_param->filt_logic_type = BTA_DM_BLE_PF_FILT_LOGIC_OR;
-  adv_filt_param->list_logic_type = BTA_DM_BLE_PF_LIST_LOGIC_OR;
-  adv_filt_param->rssi_low_thres = LOWEST_RSSI_VALUE;
-  adv_filt_param->rssi_high_thres = LOWEST_RSSI_VALUE;
-  BTM_BleAdvFilterParamSetup(
-      BTM_BLE_SCAN_COND_ADD, static_cast<tBTM_BLE_PF_FILT_INDEX>(0),
-      std::move(adv_filt_param), base::Bind(&bte_scan_filt_param_cfg_evt));
-
   /* Will be enabled to true once inquiry busy level has been received */
   btif_dm_inquiry_in_progress = false;
   /* find nearby devices */
-  BTA_DmSearch(btif_dm_search_devices_evt, is_bonding_or_sdp());
+  BTA_DmSearch(btif_dm_search_devices_evt);
 }
 
 /*******************************************************************************
@@ -2164,6 +2262,139 @@ void btif_dm_ssp_reply(const RawAddress bd_addr, bt_ssp_variant_t variant,
 
 /*******************************************************************************
  *
+ * Function         btif_dm_get_local_class_of_device
+ *
+ * Description      Reads the system property configured class of device
+ *
+ * Inputs           A pointer to a DEV_CLASS that you want filled with the
+ *                  current class of device. Size is assumed to be 3.
+ *
+ * Returns          Nothing. device_class will contain the current class of
+ *                  device. If no value is present, or the value is malformed
+ *                  the default "unclassified" value will be used
+ *
+ ******************************************************************************/
+void btif_dm_get_local_class_of_device(DEV_CLASS device_class) {
+  /* A class of device is a {SERVICE_CLASS, MAJOR_CLASS, MINOR_CLASS}
+   *
+   * The input is expected to be a string of the following format:
+   * <decimal number>,<decimal number>,<decimal number>
+   *
+   * For example, "90,2,12" (Hex: 0x5A, 0x2, 0xC)
+   *
+   * Notice there is always two commas and no spaces.
+   */
+
+  device_class[0] = 0x00;
+  device_class[1] = BTM_COD_MAJOR_UNCLASSIFIED;
+  device_class[2] = BTM_COD_MINOR_UNCLASSIFIED;
+
+#ifdef OS_ANDROID
+  std::vector<std::optional<std::uint32_t>> local_device_class =
+          android::sysprop::BluetoothProperties::getClassOfDevice();
+  // Error check the inputs. Use the default if problems are found
+  if (local_device_class.size() != 3) {
+    LOG_ERROR("COD malformed, must have unsigned 3 integers.");
+  } else if (!local_device_class[0].has_value()
+      || local_device_class[0].value() > 0xFF) {
+    LOG_ERROR("COD malformed, first value is missing or too large.");
+  } else if (!local_device_class[1].has_value()
+      || local_device_class[1].value() > 0xFF) {
+    LOG_ERROR("COD malformed, second value is missing or too large.");
+  } else if (!local_device_class[2].has_value()
+      || local_device_class[2].value() > 0xFF) {
+    LOG_ERROR("COD malformed, third value is missing or too large.");
+  } else {
+    device_class[0] = (uint8_t) local_device_class[0].value();
+    device_class[1] = (uint8_t) local_device_class[1].value();
+    device_class[2] = (uint8_t) local_device_class[2].value();
+  }
+#else
+  char prop_cod[PROPERTY_VALUE_MAX];
+  osi_property_get(PROPERTY_CLASS_OF_DEVICE, prop_cod, "");
+
+  // If the property is empty, use the default
+  if (prop_cod[0] == '\0') {
+    LOG_ERROR("%s: COD property is empty", __func__);
+    return;
+  }
+
+  // Start reading the contents of the property string. If at any point anything
+  // is malformed, use the default.
+  DEV_CLASS temp_device_class;
+  int i = 0;
+  int j = 0;
+  for (;;) {
+    // Build a string of all the chars until the next comma, null, or end of the
+    // buffer is reached. If any char is not a digit, then return the default.
+    std::string value;
+    while (i < PROPERTY_VALUE_MAX && prop_cod[i] != ',' && prop_cod[i] != '\0') {
+      char c = prop_cod[i++];
+      if (!std::isdigit(c)) {
+        LOG_ERROR("%s: COD malformed, '%c' is a non-digit", __func__, c);
+        return;
+      }
+      value += c;
+    }
+
+    // If we hit the end and it wasn't null terminated then return the default
+    if (i == PROPERTY_VALUE_MAX && prop_cod[PROPERTY_VALUE_MAX - 1] != '\0') {
+      LOG_ERROR("%s: COD malformed, value was truncated", __func__);
+      return;
+    }
+
+    // Each number in the list must be one byte, meaning 0 (0x00) -> 255 (0xFF)
+    if (value.size() > 3 || value.size() == 0) {
+      LOG_ERROR("%s: COD malformed, '%s' must be between [0, 255]", __func__,
+          value.c_str());
+      return;
+    }
+
+    // Grab the value. If it's too large, then return the default
+    uint32_t uint32_val = static_cast<uint32_t>(std::stoul(value.c_str()));
+    if (uint32_val > 0xFF) {
+      LOG_ERROR("%s: COD malformed, '%s' must be between [0, 255]", __func__,
+          value.c_str());
+      return;
+    }
+
+    // Otherwise, it's safe to use
+    temp_device_class[j++] = uint32_val;
+
+    // If we've reached 3 numbers then make sure we're at a null terminator
+    if (j >= 3) {
+      if (prop_cod[i] != '\0') {
+        LOG_ERROR("%s: COD malformed, more than three numbers", __func__);
+        return;
+      }
+      break;
+    }
+
+    // If we're at a null terminator then we're done
+    if (prop_cod[i] == '\0') {
+      break;
+    }
+
+    // Otherwise, skip over the comma
+    ++i;
+  }
+
+  // We must have read exactly 3 numbers
+  if (j == 3) {
+    device_class[0] = temp_device_class[0];
+    device_class[1] = temp_device_class[1];
+    device_class[2] = temp_device_class[2];
+  } else {
+    LOG_ERROR("%s: COD malformed, fewer than three numbers", __func__);
+  }
+#endif
+
+  LOG_DEBUG("%s: Using class of device '0x%x, 0x%x, 0x%x'", __func__,
+      device_class[0], device_class[1], device_class[2]);
+}
+
+/*******************************************************************************
+ *
  * Function         btif_dm_get_adapter_property
  *
  * Description     Queries the BTA for the adapter property
@@ -2190,14 +2421,15 @@ bt_status_t btif_dm_get_adapter_property(bt_property_t* prop) {
       prop->len = sizeof(bt_scan_mode_t);
     } break;
 
-    case BT_PROPERTY_ADAPTER_DISCOVERY_TIMEOUT: {
+    case BT_PROPERTY_ADAPTER_DISCOVERABLE_TIMEOUT: {
       uint32_t* tmt = (uint32_t*)prop->val;
       *tmt = 120; /* default to 120s, if not found in NV */
       prop->len = sizeof(uint32_t);
     } break;
 
     case BT_PROPERTY_CLASS_OF_DEVICE: {
-      DEV_CLASS dev_class = BTA_DM_COD;
+      DEV_CLASS dev_class;
+      btif_dm_get_local_class_of_device(dev_class);
       memcpy(prop->val, dev_class, sizeof(DEV_CLASS));
       prop->len = sizeof(DEV_CLASS);
     } break;
@@ -2236,10 +2468,7 @@ void btif_dm_get_remote_services(RawAddress remote_addr, const int transport) {
   BTIF_TRACE_EVENT("%s: transport=%d, remote_addr=%s", __func__, transport,
                    remote_addr.ToString().c_str());
 
-  BTA_DmDiscover(remote_addr, btif_dm_search_services_evt, transport,
-                 remote_addr != pairing_cb.bd_addr &&
-                     remote_addr != pairing_cb.static_bdaddr &&
-                     is_bonding_or_sdp());
+  BTA_DmDiscover(remote_addr, btif_dm_search_services_evt, transport);
 }
 
 void btif_dm_enable_service(tBTA_SERVICE_ID service_id, bool enable) {
@@ -2394,11 +2623,13 @@ void btif_dm_load_local_oob(void) {
 }
 
 static bool waiting_on_oob_advertiser_start = false;
-static uint8_t oob_advertiser_id = 0;
+static std::unique_ptr<uint8_t> oob_advertiser_id_;
 static void stop_oob_advertiser() {
+  // For chasing an advertising bug b/237023051
+  LOG_DEBUG("oob_advertiser_id: %s", oob_advertiser_id_.get());
   auto advertiser = get_ble_advertiser_instance();
-  advertiser->Unregister(oob_advertiser_id);
-  oob_advertiser_id = 0;
+  advertiser->Unregister(*oob_advertiser_id_);
+  oob_advertiser_id_ = nullptr;
 }
 
 /*******************************************************************************
@@ -2419,7 +2650,9 @@ void btif_dm_generate_local_oob_data(tBT_TRANSPORT transport) {
     // the state machine lifecycle.  Rather, lets create the data, then start
     // advertising then request the address.
     if (!waiting_on_oob_advertiser_start) {
-      if (oob_advertiser_id != 0) {
+      // For chasing an advertising bug b/237023051
+      LOG_DEBUG("oob_advertiser_id: %s", oob_advertiser_id_.get());
+      if (oob_advertiser_id_ != nullptr) {
         stop_oob_advertiser();
       }
       waiting_on_oob_advertiser_start = true;
@@ -2448,7 +2681,7 @@ static void start_advertising_callback(uint8_t id, tBT_TRANSPORT transport,
     invoke_oob_data_request_cb(transport, false, c, r, RawAddress{}, 0x00);
     SMP_ClearLocScOobData();
     waiting_on_oob_advertiser_start = false;
-    oob_advertiser_id = 0;
+    oob_advertiser_id_ = nullptr;
     return;
   }
   LOG_DEBUG("OOB advertiser with id %hhd", id);
@@ -2464,7 +2697,7 @@ static void timeout_cb(uint8_t id, tBTM_STATUS status) {
   advertiser->Unregister(id);
   SMP_ClearLocScOobData();
   waiting_on_oob_advertiser_start = false;
-  oob_advertiser_id = 0;
+  oob_advertiser_id_ = nullptr;
 }
 
 // Step Two: CallBack from Step One, advertise and get address
@@ -2476,11 +2709,12 @@ static void id_status_callback(tBT_TRANSPORT transport, bool is_valid,
     invoke_oob_data_request_cb(transport, false, c, r, RawAddress{}, 0x00);
     SMP_ClearLocScOobData();
     waiting_on_oob_advertiser_start = false;
-    oob_advertiser_id = 0;
+    oob_advertiser_id_ = nullptr;
     return;
   }
 
-  oob_advertiser_id = id;
+  oob_advertiser_id_ = std::make_unique<uint8_t>(id);
+  LOG_ERROR("oob_advertiser_id: %s", oob_advertiser_id_.get());
 
   auto advertiser = get_ble_advertiser_instance();
   AdvertiseParameters parameters;
@@ -2500,7 +2734,7 @@ static void id_status_callback(tBT_TRANSPORT transport, bool is_valid,
   advertiser->StartAdvertising(
       id,
       base::Bind(&start_advertising_callback, id, transport, is_valid, c, r),
-      parameters, advertisement, scan_data, 3600 /* timeout_s */,
+      parameters, advertisement, scan_data, 120 /* timeout_s */,
       base::Bind(&timeout_cb, id));
 }
 
@@ -2520,8 +2754,14 @@ void btif_dm_proc_loc_oob(tBT_TRANSPORT transport, bool is_valid,
     waiting_on_oob_advertiser_start = false;
     return;
   }
-  // Now that we have the data, lets start advertising and get the address.
-  start_oob_advertiser(transport, is_valid, c, r);
+  if (transport == BT_TRANSPORT_LE) {
+    // Now that we have the data, lets start advertising and get the address.
+    start_oob_advertiser(transport, is_valid, c, r);
+  } else {
+    invoke_oob_data_request_cb(transport, is_valid, c, r,
+                               *controller_get_interface()->get_address(),
+                               0x00);
+  }
 }
 
 /*******************************************************************************
@@ -2730,6 +2970,7 @@ static void btif_dm_ble_auth_cmpl_evt(tBTA_DM_AUTH_CMPL* p_auth_cmpl) {
     bond_state_changed(status, bd_addr, BT_BOND_STATE_BONDING);
   }
   bond_state_changed(status, bd_addr, state);
+  // TODO(240451061): Calling `stop_oob_advertiser();` gets command disallowed...
 }
 
 void btif_dm_load_ble_local_keys(void) {
@@ -2776,6 +3017,11 @@ void btif_dm_get_ble_local_keys(tBTA_DM_BLE_LOCAL_KEY_MASK* p_key_mask,
 
 static void btif_dm_save_ble_bonding_keys(RawAddress& bd_addr) {
   BTIF_TRACE_DEBUG("%s", __func__);
+
+  if (bd_addr.IsEmpty()) {
+    LOG_WARN("bd_addr is empty");
+    return;
+  }
 
   if (pairing_cb.ble.is_penc_key_rcvd) {
     btif_storage_add_ble_bonding_key(
@@ -3072,12 +3318,26 @@ void btif_dm_on_disable() {
  ******************************************************************************/
 void btif_dm_read_energy_info() { BTA_DmBleGetEnergyInfo(bta_energy_info_cb); }
 
-static char* btif_get_default_local_name() {
+static const char* btif_get_default_local_name() {
   if (btif_default_local_name[0] == '\0') {
     int max_len = sizeof(btif_default_local_name) - 1;
-    if (BTM_DEF_LOCAL_NAME[0] != '\0') {
-      strncpy(btif_default_local_name, BTM_DEF_LOCAL_NAME, max_len);
-    } else {
+
+    // Use the stable sysprop on Android devices, otherwise use osi_property_get
+#ifdef OS_ANDROID
+    std::optional<std::string> default_local_name =
+        android::sysprop::BluetoothProperties::getDefaultDeviceName();
+    if (default_local_name.has_value() && default_local_name.value() != "") {
+      strncpy(btif_default_local_name, default_local_name.value().c_str(),
+              max_len);
+    }
+#else
+    char prop_name[PROPERTY_VALUE_MAX];
+    osi_property_get(PROPERTY_DEFAULT_DEVICE_NAME, prop_name, "");
+    strncpy(btif_default_local_name, prop_name, max_len);
+#endif
+
+    // If no value was placed in the btif_default_local_name then use model name
+    if (btif_default_local_name[0] == '\0') {
       char prop_model[PROPERTY_VALUE_MAX];
       osi_property_get(PROPERTY_PRODUCT_MODEL, prop_model, "");
       strncpy(btif_default_local_name, prop_model, max_len);
@@ -3186,4 +3446,38 @@ void btif_debug_bond_event_dump(int fd) {
     dprintf(fd, "  %s  %s  %s  %s\n", eventtime,
             event->bd_addr.ToString().c_str(), func_name, bond_state);
   }
+}
+
+bool btif_get_device_type(const RawAddress& bda, int* p_device_type) {
+  if (p_device_type == NULL) return false;
+
+  std::string addrstr = bda.ToString();
+  const char* bd_addr_str = addrstr.c_str();
+
+  if (!btif_config_get_int(bd_addr_str, "DevType", p_device_type)) return false;
+  tBT_DEVICE_TYPE device_type = static_cast<tBT_DEVICE_TYPE>(*p_device_type);
+  LOG_DEBUG(" bd_addr:%s device_type:%s", PRIVATE_ADDRESS(bda),
+            DeviceTypeText(device_type).c_str());
+
+  return true;
+}
+
+bool btif_get_address_type(const RawAddress& bda, tBLE_ADDR_TYPE* p_addr_type) {
+  if (p_addr_type == NULL) return false;
+
+  std::string addrstr = bda.ToString();
+  const char* bd_addr_str = addrstr.c_str();
+
+  int val = 0;
+  if (!btif_config_get_int(bd_addr_str, "AddrType", &val)) return false;
+  *p_addr_type = static_cast<tBLE_ADDR_TYPE>(val);
+
+  LOG_DEBUG(" bd_addr:%s[%s]", PRIVATE_ADDRESS(bda),
+            AddressTypeText(*p_addr_type).c_str());
+  return true;
+}
+
+void btif_dm_clear_event_filter() {
+  LOG_VERBOSE("%s: called", __func__);
+  bta_dm_clear_event_filter();
 }

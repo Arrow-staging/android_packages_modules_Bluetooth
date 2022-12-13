@@ -245,6 +245,7 @@ void LogMetricSocketConnectionState(
  */
 void LogMetricManufacturerInfo(
     const hci::Address& address,
+    android::bluetooth::AddressTypeEnum address_type,
     android::bluetooth::DeviceInfoSrcEnum source_type,
     const std::string& source_name,
     const std::string& manufacturer,
@@ -263,6 +264,8 @@ void LogMetricBluetoothHalCrashReason(
     const hci::Address& address,
     uint32_t error_code,
     uint32_t vendor_error_code);
+
+void LogMetricBluetoothCodePathCounterMetrics(int32_t key, int64_t count);
 }  // namespace os
 
 }  // namespace bluetooth

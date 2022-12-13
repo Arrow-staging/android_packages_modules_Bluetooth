@@ -5,7 +5,7 @@ use num_traits::cast::FromPrimitive;
 use std::sync::{Arc, Mutex};
 use topshim_macros::cb_variant;
 
-#[derive(Debug, FromPrimitive, PartialEq, PartialOrd)]
+#[derive(Debug, FromPrimitive, ToPrimitive, PartialEq, PartialOrd)]
 #[repr(u32)]
 pub enum BtavConnectionState {
     Disconnected = 0,
@@ -133,17 +133,17 @@ pub mod ffi {
         address: [u8; 6],
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Copy, Clone)]
     pub struct A2dpCodecConfig {
-        codec_type: i32,
-        codec_priority: i32,
-        sample_rate: i32,
-        bits_per_sample: i32,
-        channel_mode: i32,
-        codec_specific_1: i64,
-        codec_specific_2: i64,
-        codec_specific_3: i64,
-        codec_specific_4: i64,
+        pub codec_type: i32,
+        pub codec_priority: i32,
+        pub sample_rate: i32,
+        pub bits_per_sample: i32,
+        pub channel_mode: i32,
+        pub codec_specific_1: i64,
+        pub codec_specific_2: i64,
+        pub codec_specific_3: i64,
+        pub codec_specific_4: i64,
     }
 
     #[derive(Debug, Default)]
@@ -293,31 +293,16 @@ impl A2dp {
         true
     }
 
-    pub fn connect(&mut self, device: String) {
-        let addr = RawAddress::from_string(device.clone());
-        if addr.is_none() {
-            eprintln!("Invalid device string {}", device);
-            return;
-        }
-        self.internal.connect(addr.unwrap().into());
+    pub fn connect(&mut self, addr: RawAddress) {
+        self.internal.connect(addr.into());
     }
 
-    pub fn set_active_device(&mut self, device: String) {
-        let addr = RawAddress::from_string(device.clone());
-        if addr.is_none() {
-            eprintln!("Invalid device string {}", device);
-            return;
-        }
-        self.internal.set_active_device(addr.unwrap().into());
+    pub fn set_active_device(&mut self, addr: RawAddress) {
+        self.internal.set_active_device(addr.into());
     }
 
-    pub fn disconnect(&mut self, device: String) {
-        let addr = RawAddress::from_string(device.clone());
-        if addr.is_none() {
-            eprintln!("Invalid device string {}", device);
-            return;
-        }
-        self.internal.disconnect(addr.unwrap().into());
+    pub fn disconnect(&mut self, addr: RawAddress) {
+        self.internal.disconnect(addr.into());
     }
 
     pub fn set_audio_config(&self, sample_rate: i32, bits_per_sample: i32, channel_mode: i32) {

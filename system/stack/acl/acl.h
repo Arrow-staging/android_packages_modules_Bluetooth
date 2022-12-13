@@ -46,6 +46,11 @@ enum btm_acl_swkey_state_t {
   BTM_ACL_SWKEY_STATE_IN_PROGRESS = 5,
 };
 
+enum btm_data_direction {
+  HOST_TO_CONTROLLER = 0,
+  CONTROLLER_TO_HOST = 1,
+};
+
 /* Policy settings status */
 typedef enum : uint16_t {
   HCI_DISABLE_ALL_LM_MODES = 0,
@@ -243,7 +248,7 @@ struct tACL_CONN {
   friend tBTM_STATUS btm_remove_acl(const RawAddress& bd_addr,
                                     tBT_TRANSPORT transport);
   friend void acl_disconnect_after_role_switch(uint16_t conn_handle,
-                                               tHCI_STATUS reason);
+                                               tHCI_STATUS reason, std::string);
   friend void bluetooth::shim::btm_pm_on_mode_change(tHCI_STATUS status,
                                                      uint16_t handle,
                                                      tHCI_MODE hci_mode,
@@ -414,3 +419,6 @@ struct tACL_CB {
     return cnt;
   }
 };
+
+extern tACL_CONN* btm_acl_for_bda(const RawAddress& bd_addr,
+                                  tBT_TRANSPORT transport);

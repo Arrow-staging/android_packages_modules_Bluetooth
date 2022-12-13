@@ -3,6 +3,7 @@
 use bt_topshim::btif;
 use bt_topshim::btif::{BaseCallbacks, BaseCallbacksDispatcher, BluetoothInterface};
 
+use bt_topshim_facade_protobuf::empty::Empty;
 use bt_topshim_facade_protobuf::facade::{
     EventType, FetchEventsRequest, FetchEventsResponse, SetDiscoveryModeRequest,
     SetDiscoveryModeResponse, ToggleStackRequest, ToggleStackResponse,
@@ -40,9 +41,11 @@ fn get_bt_dispatcher(
 /// Main object for Adapter facade service
 #[derive(Clone)]
 pub struct AdapterServiceImpl {
+    #[allow(dead_code)]
     rt: Arc<Runtime>,
     btif_intf: Arc<Mutex<BluetoothInterface>>,
     event_rx: Arc<TokioMutex<mpsc::Receiver<BaseCallbacks>>>,
+    #[allow(dead_code)]
     event_tx: mpsc::Sender<BaseCallbacks>,
 }
 
@@ -114,6 +117,13 @@ impl AdapterService for AdapterServiceImpl {
 
         ctx.spawn(async move {
             sink.success(SetDiscoveryModeResponse::default()).await.unwrap();
+        })
+    }
+
+    fn clear_event_filter(&mut self, ctx: RpcContext<'_>, _req: Empty, sink: UnarySink<Empty>) {
+        self.btif_intf.lock().unwrap().clear_event_filter();
+        ctx.spawn(async move {
+            sink.success(Empty::default()).await.unwrap();
         })
     }
 }

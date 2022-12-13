@@ -61,7 +61,7 @@ void bluetooth::shim::ACL_WriteData(uint16_t handle, BT_HDR* p_buf) {
   mock_function_count_map[__func__]++;
 }
 void bluetooth::shim::ACL_Disconnect(uint16_t handle, bool is_classic,
-                                     tHCI_STATUS reason) {
+                                     tHCI_STATUS reason, std::string comment) {
   mock_function_count_map[__func__]++;
 }
 void bluetooth::shim::ACL_IgnoreAllLeConnections() {
@@ -69,7 +69,7 @@ void bluetooth::shim::ACL_IgnoreAllLeConnections() {
 }
 void bluetooth::shim::ACL_ReadConnectionAddress(const RawAddress& pseudo_addr,
                                                 RawAddress& conn_addr,
-                                                uint8_t* p_addr_type) {
+                                                tBLE_ADDR_TYPE* p_addr_type) {
   mock_function_count_map[__func__]++;
 }
 

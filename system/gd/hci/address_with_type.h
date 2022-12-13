@@ -73,7 +73,7 @@ class AddressWithType final {
   }
 
   bool operator<(const AddressWithType& rhs) const {
-    return address_ < rhs.address_ && address_type_ < rhs.address_type_;
+    return (address_ != rhs.address_) ? address_ < rhs.address_ : address_type_ < rhs.address_type_;
   }
   bool operator==(const AddressWithType& rhs) const {
     return address_ == rhs.address_ && address_type_ == rhs.address_type_;
@@ -89,6 +89,28 @@ class AddressWithType final {
   }
   bool operator!=(const AddressWithType& rhs) const {
     return !(*this == rhs);
+  }
+
+  FilterAcceptListAddressType ToFilterAcceptListAddressType() const {
+    switch (address_type_) {
+      case AddressType::PUBLIC_DEVICE_ADDRESS:
+      case AddressType::PUBLIC_IDENTITY_ADDRESS:
+        return FilterAcceptListAddressType::PUBLIC;
+      case AddressType::RANDOM_DEVICE_ADDRESS:
+      case AddressType::RANDOM_IDENTITY_ADDRESS:
+        return FilterAcceptListAddressType::RANDOM;
+    }
+  }
+
+  PeerAddressType ToPeerAddressType() const {
+    switch (address_type_) {
+      case AddressType::PUBLIC_DEVICE_ADDRESS:
+      case AddressType::PUBLIC_IDENTITY_ADDRESS:
+        return PeerAddressType::PUBLIC_DEVICE_OR_IDENTITY_ADDRESS;
+      case AddressType::RANDOM_DEVICE_ADDRESS:
+      case AddressType::RANDOM_IDENTITY_ADDRESS:
+        return PeerAddressType::RANDOM_DEVICE_OR_IDENTITY_ADDRESS;
+    }
   }
 
   std::string ToString() const {

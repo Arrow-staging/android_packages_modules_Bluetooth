@@ -223,7 +223,7 @@ static void bta_av_rc_ctrl_cback(uint8_t handle, uint8_t event,
         (tBTA_AV_RC_CONN_CHG*)osi_malloc(sizeof(tBTA_AV_RC_CONN_CHG));
     p_msg->hdr.event = msg_event;
     p_msg->handle = handle;
-    if (peer_addr) p_msg->peer_addr = *peer_addr;
+    p_msg->peer_addr = (peer_addr) ? (*peer_addr) : RawAddress::kEmpty;
     bta_sys_sendmsg(p_msg);
   }
 }
@@ -1337,6 +1337,38 @@ void bta_av_api_disconnect(tBTA_AV_DATA* p_data) {
       bta_av_hndl_to_scb(p_data->api_discnt.hdr.layer_specific);
   AVDT_DisconnectReq(p_scb->PeerAddress(), bta_av_conn_cback);
   alarm_cancel(p_scb->link_signalling_timer);
+}
+
+/*******************************************************************************
+ *
+ * Function         bta_av_set_use_latency_mode
+ *
+ * Description      Sets stream use latency mode.
+ *
+ * Returns          void
+ *
+ ******************************************************************************/
+void bta_av_set_use_latency_mode(tBTA_AV_SCB* p_scb, bool use_latency_mode) {
+  L2CA_UseLatencyMode(p_scb->PeerAddress(), use_latency_mode);
+}
+
+/*******************************************************************************
+ *
+ * Function         bta_av_api_set_latency
+ *
+ * Description      set stream latency.
+ *
+ * Returns          void
+ *
+ ******************************************************************************/
+void bta_av_api_set_latency(tBTA_AV_DATA* p_data) {
+  tBTA_AV_SCB* p_scb =
+      bta_av_hndl_to_scb(p_data->api_set_latency.hdr.layer_specific);
+
+  tL2CAP_LATENCY latency = p_data->api_set_latency.is_low_latency
+                               ? L2CAP_LATENCY_LOW
+                               : L2CAP_LATENCY_NORMAL;
+  L2CA_SetAclLatency(p_scb->PeerAddress(), latency);
 }
 
 /**

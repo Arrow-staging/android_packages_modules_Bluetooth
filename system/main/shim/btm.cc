@@ -18,6 +18,8 @@
 
 #include "main/shim/btm.h"
 
+#include <base/logging.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
@@ -40,11 +42,10 @@
 #include "main/shim/shim.h"
 #include "stack/btm/btm_dev.h"
 #include "stack/btm/btm_int_types.h"
+#include "types/ble_address_with_type.h"
 #include "types/bluetooth/uuid.h"
 #include "types/bt_transport.h"
 #include "types/raw_address.h"
-
-#include <base/logging.h>
 
 extern tBTM_CB btm_cb;
 
@@ -55,15 +56,16 @@ static constexpr bool kPassiveScanning = false;
 
 using BtmRemoteDeviceName = tBTM_REMOTE_DEV_NAME;
 
-extern void btm_process_cancel_complete(uint8_t status, uint8_t mode);
-extern void btm_process_inq_complete(uint8_t status, uint8_t result_type);
+extern void btm_process_cancel_complete(tHCI_STATUS status, uint8_t mode);
+extern void btm_process_inq_complete(tHCI_STATUS status, uint8_t result_type);
 extern void btm_ble_process_adv_addr(RawAddress& raw_address,
                                      tBLE_ADDR_TYPE* address_type);
 extern void btm_ble_process_adv_pkt_cont(
-    uint16_t event_type, uint8_t address_type, const RawAddress& raw_address,
-    uint8_t primary_phy, uint8_t secondary_phy, uint8_t advertising_sid,
-    int8_t tx_power, int8_t rssi, uint16_t periodic_adv_int, uint8_t data_len,
-    uint8_t* data);
+    uint16_t event_type, tBLE_ADDR_TYPE address_type,
+    const RawAddress& raw_address, uint8_t primary_phy, uint8_t secondary_phy,
+    uint8_t advertising_sid, int8_t tx_power, int8_t rssi,
+    uint16_t periodic_adv_int, uint8_t data_len, const uint8_t* data,
+    const RawAddress& original_bda);
 
 extern void btm_api_process_inquiry_result(const RawAddress& raw_address,
                                            uint8_t page_scan_rep_mode,
@@ -118,7 +120,7 @@ void Btm::ScanningCallbacks::OnScanResult(
     uint8_t primary_phy, uint8_t secondary_phy, uint8_t advertising_sid,
     int8_t tx_power, int8_t rssi, uint16_t periodic_advertising_interval,
     std::vector<uint8_t> advertising_data) {
-  tBLE_ADDR_TYPE ble_address_type = static_cast<tBLE_ADDR_TYPE>(address_type);
+  tBLE_ADDR_TYPE ble_address_type = to_ble_addr_type(address_type);
   uint16_t extended_event_type = 0;
 
   RawAddress raw_address;
@@ -128,12 +130,14 @@ void Btm::ScanningCallbacks::OnScanResult(
     btm_ble_process_adv_addr(raw_address, &ble_address_type);
   }
 
+  // Pass up to GattService#onScanResult
+  RawAddress original_bda = raw_address;
   btm_ble_process_adv_addr(raw_address, &ble_address_type);
-  btm_ble_process_adv_pkt_cont(extended_event_type, ble_address_type,
-                               raw_address, primary_phy, secondary_phy,
-                               advertising_sid, tx_power, rssi,
-                               periodic_advertising_interval,
-                               advertising_data.size(), &advertising_data[0]);
+  btm_ble_process_adv_pkt_cont(
+      extended_event_type, ble_address_type, raw_address, primary_phy,
+      secondary_phy, advertising_sid, tx_power, rssi,
+      periodic_advertising_interval, advertising_data.size(),
+      &advertising_data[0], original_bda);
 }
 
 void Btm::ScanningCallbacks::OnTrackAdvFoundLost(
@@ -153,6 +157,17 @@ void Btm::ScanningCallbacks::OnFilterParamSetup(
 void Btm::ScanningCallbacks::OnFilterConfigCallback(
     bluetooth::hci::ApcfFilterType filter_type, uint8_t available_spaces,
     bluetooth::hci::ApcfAction action, uint8_t status){};
+void Btm::ScanningCallbacks::OnPeriodicSyncStarted(
+    int reg_id, uint8_t status, uint16_t sync_handle, uint8_t advertising_sid,
+    bluetooth::hci::AddressWithType address_with_type, uint8_t phy,
+    uint16_t interval) {}
+void Btm::ScanningCallbacks::OnPeriodicSyncReport(uint16_t sync_handle,
+                                                  int8_t tx_power, int8_t rssi,
+                                                  uint8_t status,
+                                                  std::vector<uint8_t> data) {}
+void Btm::ScanningCallbacks::OnPeriodicSyncLost(uint16_t sync_handle) {}
+void Btm::ScanningCallbacks::OnPeriodicSyncTransferred(
+    int pa_source, uint8_t status, bluetooth::hci::Address address) {}
 
 Btm::Btm(os::Handler* handler, neighbor::InquiryModule* inquiry)
     : scanning_timer_(handler), observing_timer_(handler) {
@@ -170,7 +185,7 @@ Btm::Btm(os::Handler* handler, neighbor::InquiryModule* inquiry)
 }
 
 void Btm::OnInquiryResult(bluetooth::hci::InquiryResultView view) {
-  for (auto& response : view.GetInquiryResults()) {
+  for (auto& response : view.GetResponses()) {
     btm_api_process_inquiry_result(
         ToRawAddress(response.bd_addr_),
         static_cast<uint8_t>(response.page_scan_repetition_mode_),
@@ -180,7 +195,7 @@ void Btm::OnInquiryResult(bluetooth::hci::InquiryResultView view) {
 
 void Btm::OnInquiryResultWithRssi(
     bluetooth::hci::InquiryResultWithRssiView view) {
-  for (auto& response : view.GetInquiryResults()) {
+  for (auto& response : view.GetResponses()) {
     btm_api_process_inquiry_result_with_rssi(
         ToRawAddress(response.address_),
         static_cast<uint8_t>(response.page_scan_repetition_mode_),
@@ -674,7 +689,7 @@ hci::AddressWithType Btm::GetAddressAndType(const RawAddress& bd_addr) {
                                p_dev_rec->ble.identity_address_with_type.type);
     } else {
       return ToAddressWithType(p_dev_rec->ble.pseudo_addr,
-                               p_dev_rec->ble.ble_addr_type);
+                               p_dev_rec->ble.AddressType());
     }
   }
   LOG(ERROR) << "Unknown bd_addr. Use public address";

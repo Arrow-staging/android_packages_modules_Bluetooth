@@ -85,10 +85,11 @@ void bluetooth::shim::ACL_ConfigureLePrivacy(bool is_le_privacy_enabled) {
 }
 
 void bluetooth::shim::ACL_Disconnect(uint16_t handle, bool is_classic,
-                                     tHCI_STATUS reason) {
+                                     tHCI_STATUS reason, std::string comment) {
   (is_classic)
-      ? Stack::GetInstance()->GetAcl()->DisconnectClassic(handle, reason)
-      : Stack::GetInstance()->GetAcl()->DisconnectLe(handle, reason);
+      ? Stack::GetInstance()->GetAcl()->DisconnectClassic(handle, reason,
+                                                          comment)
+      : Stack::GetInstance()->GetAcl()->DisconnectLe(handle, reason, comment);
 }
 
 void bluetooth::shim::ACL_Shutdown() {
@@ -101,11 +102,11 @@ void bluetooth::shim::ACL_IgnoreAllLeConnections() {
 
 void bluetooth::shim::ACL_ReadConnectionAddress(const RawAddress& pseudo_addr,
                                                 RawAddress& conn_addr,
-                                                uint8_t* p_addr_type) {
+                                                tBLE_ADDR_TYPE* p_addr_type) {
   auto local_address =
       Stack::GetInstance()->GetAcl()->GetConnectionLocalAddress(pseudo_addr);
   conn_addr = ToRawAddress(local_address.GetAddress());
-  *p_addr_type = static_cast<uint8_t>(local_address.GetAddressType());
+  *p_addr_type = static_cast<tBLE_ADDR_TYPE>(local_address.GetAddressType());
 }
 
 void bluetooth::shim::ACL_AddToAddressResolution(
@@ -125,4 +126,8 @@ void bluetooth::shim::ACL_RemoveFromAddressResolution(
 
 void bluetooth::shim::ACL_ClearAddressResolution() {
   Stack::GetInstance()->GetAcl()->ClearAddressResolution();
+}
+
+void bluetooth::shim::ACL_ClearAcceptList() {
+  Stack::GetInstance()->GetAcl()->ClearAcceptList();
 }

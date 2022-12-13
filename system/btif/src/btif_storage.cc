@@ -39,8 +39,11 @@
 #include <string.h>
 #include <time.h>
 
+#include <vector>
+
 #include "bta_csis_api.h"
 #include "bta_groups.h"
+#include "bta_has_api.h"
 #include "bta_hd_api.h"
 #include "bta_hearing_aid_api.h"
 #include "bta_hh_api.h"
@@ -51,6 +54,7 @@
 #include "btif_hh.h"
 #include "btif_util.h"
 #include "device/include/controller.h"
+#include "gd/common/init_flags.h"
 #include "osi/include/allocator.h"
 #include "osi/include/compat.h"
 #include "osi/include/config.h"
@@ -96,6 +100,16 @@ using bluetooth::groups::DeviceGroups;
 #define BTIF_STORAGE_CSIS_AUTOCONNECT "CsisAutoconnect"
 #define BTIF_STORAGE_CSIS_SET_INFO_BIN "CsisSetInfoBin"
 #define BTIF_STORAGE_LEAUDIO_AUTOCONNECT "LeAudioAutoconnect"
+#define BTIF_STORAGE_LEAUDIO_HANDLES_BIN "LeAudioHandlesBin"
+#define BTIF_STORAGE_LEAUDIO_SINK_PACS_BIN "SinkPacsBin"
+#define BTIF_STORAGE_LEAUDIO_SOURCE_PACS_BIN "SourcePacsBin"
+#define BTIF_STORAGE_LEAUDIO_ASES_BIN "AsesBin"
+#define BTIF_STORAGE_LEAUDIO_SINK_AUDIOLOCATION "SinkAudioLocation"
+#define BTIF_STORAGE_LEAUDIO_SOURCE_AUDIOLOCATION "SourceAudioLocation"
+#define BTIF_STORAGE_LEAUDIO_SINK_SUPPORTED_CONTEXT_TYPE \
+  "SinkSupportedContextType"
+#define BTIF_STORAGE_LEAUDIO_SOURCE_SUPPORTED_CONTEXT_TYPE \
+  "SourceSupportedContextType"
 
 /* This is a local property to add a device found */
 #define BT_PROPERTY_REMOTE_DEVICE_TIMESTAMP 0xFF
@@ -245,7 +259,7 @@ static int prop2cfg(const RawAddress* remote_bd_addr, bt_property_t* prop) {
       btif_config_set_int("Adapter", BTIF_STORAGE_KEY_LOCAL_IO_CAPS_BLE,
                           *(int*)prop->val);
       break;
-    case BT_PROPERTY_ADAPTER_DISCOVERY_TIMEOUT:
+    case BT_PROPERTY_ADAPTER_DISCOVERABLE_TIMEOUT:
       btif_config_set_int("Adapter", BTIF_STORAGE_KEY_ADAPTER_DISC_TIMEOUT,
                           *(int*)prop->val);
       break;
@@ -355,7 +369,7 @@ static int cfg2prop(const RawAddress* remote_bd_addr, bt_property_t* prop) {
                                   (int*)prop->val);
       break;
 
-    case BT_PROPERTY_ADAPTER_DISCOVERY_TIMEOUT:
+    case BT_PROPERTY_ADAPTER_DISCOVERABLE_TIMEOUT:
       if (prop->len >= (int)sizeof(int))
         ret = btif_config_get_int(
             "Adapter", BTIF_STORAGE_KEY_ADAPTER_DISC_TIMEOUT, (int*)prop->val);
@@ -483,7 +497,12 @@ static bt_status_t btif_in_fetch_bonded_devices(
           }
         }
         bt_linkkey_file_found = true;
-        p_bonded_devices->devices[p_bonded_devices->num_devices++] = bd_addr;
+        if (p_bonded_devices->num_devices < BTM_SEC_MAX_DEVICE_RECORDS) {
+          p_bonded_devices->devices[p_bonded_devices->num_devices++] = bd_addr;
+        } else {
+          BTIF_TRACE_WARNING("%s: exceed the max number of bonded devices",
+                             __func__);
+        }
       } else {
         bt_linkkey_file_found = false;
       }
@@ -656,10 +675,8 @@ bt_status_t btif_storage_get_adapter_property(bt_property_t* property) {
         "Property:BT_PROPERTY_ADAPTER_BONDED_DEVICES",
         __func__, bonded_devices.num_devices);
 
-    if (bonded_devices.num_devices > 0) {
-      property->len = bonded_devices.num_devices * RawAddress::kLength;
-      memcpy(property->val, bonded_devices.devices, property->len);
-    }
+    property->len = bonded_devices.num_devices * RawAddress::kLength;
+    memcpy(property->val, bonded_devices.devices, property->len);
 
     /* if there are no bonded_devices, then length shall be 0 */
     return BT_STATUS_SUCCESS;
@@ -890,6 +907,14 @@ bt_status_t btif_storage_remove_bonded_device(
 
   /* write bonded info immediately */
   btif_config_flush();
+
+  /* Check the length of the paired devices, and if 0 then reset IRK */
+  auto paired_devices = btif_config_get_paired_devices();
+  if (paired_devices.empty() &&
+      bluetooth::common::init_flags::irk_rotation_is_enabled()) {
+    LOG_INFO("Last paired device removed, resetting IRK");
+    BTA_DmBleResetId();
+  }
   return ret ? BT_STATUS_SUCCESS : BT_STATUS_FAIL;
 }
 
@@ -923,6 +948,76 @@ static void remove_devices_with_sample_ltk() {
                << ": removing bond to device using test TLK: " << address;
 
     btif_storage_remove_bonded_device(&address);
+  }
+}
+
+/*******************************************************************************
+ *
+ * Function         btif_storage_load_le_devices
+ *
+ * Description      BTIF storage API - Loads all LE-only and Dual Mode devices
+ *                  from NVRAM. This API invokes the adaper_properties_cb.
+ *                  It also invokes invoke_address_consolidate_cb
+ *                  to consolidate each Dual Mode device and
+ *                  invoke_le_address_associate_cb to associate each LE-only
+ *                  device between its RPA and identity address.
+ *
+ ******************************************************************************/
+void btif_storage_load_le_devices(void) {
+  btif_bonded_devices_t bonded_devices;
+  btif_in_fetch_bonded_devices(&bonded_devices, 1);
+  std::unordered_set<RawAddress> bonded_addresses;
+  for (uint16_t i = 0; i < bonded_devices.num_devices; i++) {
+    bonded_addresses.insert(bonded_devices.devices[i]);
+  }
+
+  std::vector<std::pair<RawAddress, RawAddress>> consolidated_devices;
+  for (uint16_t i = 0; i < bonded_devices.num_devices; i++) {
+    // RawAddress* p_remote_addr;
+    tBTA_LE_KEY_VALUE key = {};
+    if (btif_storage_get_ble_bonding_key(
+            bonded_devices.devices[i], BTM_LE_KEY_PID, (uint8_t*)&key,
+            sizeof(tBTM_LE_PID_KEYS)) == BT_STATUS_SUCCESS) {
+      if (bonded_devices.devices[i] != key.pid_key.identity_addr) {
+        LOG_INFO("found device with a known identity address %s %s",
+                 bonded_devices.devices[i].ToString().c_str(),
+                 key.pid_key.identity_addr.ToString().c_str());
+
+        if (bonded_devices.devices[i].IsEmpty() ||
+            key.pid_key.identity_addr.IsEmpty()) {
+          LOG_WARN("Address is empty! Skip");
+        } else {
+          consolidated_devices.emplace_back(bonded_devices.devices[i],
+                                            key.pid_key.identity_addr);
+        }
+      }
+    }
+  }
+
+  bt_property_t adapter_prop = {};
+  /* Send the adapter_properties_cb with bonded consolidated device */
+  {
+    /* BONDED_DEVICES */
+    auto devices_list =
+        std::make_unique<RawAddress[]>(consolidated_devices.size());
+    adapter_prop.type = BT_PROPERTY_ADAPTER_BONDED_DEVICES;
+    adapter_prop.len = consolidated_devices.size() * sizeof(RawAddress);
+    adapter_prop.val = devices_list.get();
+    for (uint16_t i = 0; i < consolidated_devices.size(); i++) {
+      devices_list[i] = consolidated_devices[i].first;
+    }
+    btif_adapter_properties_evt(BT_STATUS_SUCCESS, /* num_props */ 1,
+                                &adapter_prop);
+  }
+
+  for (const auto& device : consolidated_devices) {
+    if (bonded_addresses.find(device.second) != bonded_addresses.end()) {
+      // Invokes address consolidation for DuMo devices
+      invoke_address_consolidate_cb(device.first, device.second);
+    } else {
+      // Associates RPA & identity address for LE-only devices
+      invoke_le_address_associate_cb(device.first, device.second);
+    }
   }
 }
 
@@ -987,9 +1082,9 @@ bt_status_t btif_storage_load_bonded_devices(void) {
     num_props++;
 
     /* DISC_TIMEOUT */
-    BTIF_STORAGE_GET_ADAPTER_PROP(status, BT_PROPERTY_ADAPTER_DISCOVERY_TIMEOUT,
-                                  &disc_timeout, sizeof(disc_timeout),
-                                  adapter_props[num_props]);
+    BTIF_STORAGE_GET_ADAPTER_PROP(
+        status, BT_PROPERTY_ADAPTER_DISCOVERABLE_TIMEOUT, &disc_timeout,
+        sizeof(disc_timeout), adapter_props[num_props]);
     num_props++;
 
     /* BONDED_DEVICES */
@@ -1209,7 +1304,10 @@ bt_status_t btif_storage_add_ble_local_key(const Octet16& key,
       return BT_STATUS_FAIL;
   }
   int ret = btif_config_set_bin("Adapter", name, key.data(), key.size());
-  btif_config_save();
+  // Had to change this to flush to get it to work on test.
+  // Seems to work in the real world on a phone... but not sure why there's a
+  // race in test. Investigate b/239828132
+  btif_config_flush();
   return ret ? BT_STATUS_SUCCESS : BT_STATUS_FAIL;
 }
 
@@ -1310,7 +1408,12 @@ static bt_status_t btif_in_fetch_bonded_ble_device(
 
     // Fill in the bonded devices
     if (device_added) {
-      p_bonded_devices->devices[p_bonded_devices->num_devices++] = bd_addr;
+      if (p_bonded_devices->num_devices < BTM_SEC_MAX_DEVICE_RECORDS) {
+        p_bonded_devices->devices[p_bonded_devices->num_devices++] = bd_addr;
+      } else {
+        BTIF_TRACE_WARNING("%s: exceed the max number of bonded devices",
+                           __func__);
+      }
       btif_gatts_add_bonded_dev_from_nv(bd_addr);
     }
 
@@ -1769,6 +1872,116 @@ void btif_storage_set_leaudio_autoconnect(const RawAddress& addr,
                                   addr, autoconnect));
 }
 
+/** Store ASEs information */
+void btif_storage_leaudio_update_handles_bin(const RawAddress& addr) {
+  std::vector<uint8_t> handles;
+
+  if (LeAudioClient::GetHandlesForStorage(addr, handles)) {
+    do_in_jni_thread(
+        FROM_HERE,
+        Bind(
+            [](const RawAddress& bd_addr, std::vector<uint8_t> handles) {
+              auto bdstr = bd_addr.ToString();
+              btif_config_set_bin(bdstr, BTIF_STORAGE_LEAUDIO_HANDLES_BIN,
+                                  handles.data(), handles.size());
+              btif_config_save();
+            },
+            addr, std::move(handles)));
+  }
+}
+
+/** Store PACs information */
+void btif_storage_leaudio_update_pacs_bin(const RawAddress& addr) {
+  std::vector<uint8_t> sink_pacs;
+
+  if (LeAudioClient::GetSinkPacsForStorage(addr, sink_pacs)) {
+    do_in_jni_thread(
+        FROM_HERE,
+        Bind(
+            [](const RawAddress& bd_addr, std::vector<uint8_t> sink_pacs) {
+              auto bdstr = bd_addr.ToString();
+              btif_config_set_bin(bdstr, BTIF_STORAGE_LEAUDIO_SINK_PACS_BIN,
+                                  sink_pacs.data(), sink_pacs.size());
+              btif_config_save();
+            },
+            addr, std::move(sink_pacs)));
+  }
+
+  std::vector<uint8_t> source_pacs;
+  if (LeAudioClient::GetSourcePacsForStorage(addr, source_pacs)) {
+    do_in_jni_thread(
+        FROM_HERE,
+        Bind(
+            [](const RawAddress& bd_addr, std::vector<uint8_t> source_pacs) {
+              auto bdstr = bd_addr.ToString();
+              btif_config_set_bin(bdstr, BTIF_STORAGE_LEAUDIO_SOURCE_PACS_BIN,
+                                  source_pacs.data(), source_pacs.size());
+              btif_config_save();
+            },
+            addr, std::move(source_pacs)));
+  }
+}
+
+/** Store ASEs information */
+void btif_storage_leaudio_update_ase_bin(const RawAddress& addr) {
+  std::vector<uint8_t> ases;
+
+  if (LeAudioClient::GetAsesForStorage(addr, ases)) {
+    do_in_jni_thread(
+        FROM_HERE,
+        Bind(
+            [](const RawAddress& bd_addr, std::vector<uint8_t> ases) {
+              auto bdstr = bd_addr.ToString();
+              btif_config_set_bin(bdstr, BTIF_STORAGE_LEAUDIO_ASES_BIN,
+                                  ases.data(), ases.size());
+              btif_config_save();
+            },
+            addr, std::move(ases)));
+  }
+}
+
+/** Store Le Audio device audio locations */
+void btif_storage_set_leaudio_audio_location(const RawAddress& addr,
+                                             uint32_t sink_location,
+                                             uint32_t source_location) {
+  do_in_jni_thread(
+      FROM_HERE,
+      Bind(
+          [](const RawAddress& addr, int sink_location, int source_location) {
+            std::string bdstr = addr.ToString();
+            LOG_DEBUG("saving le audio device: %s", bdstr.c_str());
+            btif_config_set_int(bdstr, BTIF_STORAGE_LEAUDIO_SINK_AUDIOLOCATION,
+                                sink_location);
+            btif_config_set_int(bdstr,
+                                BTIF_STORAGE_LEAUDIO_SOURCE_AUDIOLOCATION,
+                                source_location);
+            btif_config_save();
+          },
+          addr, sink_location, source_location));
+}
+
+/** Store Le Audio device context types */
+void btif_storage_set_leaudio_supported_context_types(
+    const RawAddress& addr, uint16_t sink_supported_context_type,
+    uint16_t source_supported_context_type) {
+  do_in_jni_thread(
+      FROM_HERE,
+      Bind(
+          [](const RawAddress& addr, int sink_supported_context_type,
+             int source_supported_context_type) {
+            std::string bdstr = addr.ToString();
+            LOG_DEBUG("saving le audio device: %s", bdstr.c_str());
+            btif_config_set_int(
+                bdstr, BTIF_STORAGE_LEAUDIO_SINK_SUPPORTED_CONTEXT_TYPE,
+                sink_supported_context_type);
+            btif_config_set_int(
+                bdstr, BTIF_STORAGE_LEAUDIO_SOURCE_SUPPORTED_CONTEXT_TYPE,
+                source_supported_context_type);
+            btif_config_save();
+          },
+          addr, sink_supported_context_type, source_supported_context_type));
+}
+
 /** Loads information about bonded Le Audio devices */
 void btif_storage_load_bonded_leaudio() {
   for (const auto& bd_addr : btif_config_get_paired_devices()) {
@@ -1800,8 +2013,65 @@ void btif_storage_load_bonded_leaudio() {
     if (btif_config_get_int(name, BTIF_STORAGE_LEAUDIO_AUTOCONNECT, &value))
       autoconnect = !!value;
 
+    int sink_audio_location = 0;
+    if (btif_config_get_int(name, BTIF_STORAGE_LEAUDIO_SINK_AUDIOLOCATION,
+                            &value))
+      sink_audio_location = value;
+
+    int source_audio_location = 0;
+    if (btif_config_get_int(name, BTIF_STORAGE_LEAUDIO_SOURCE_AUDIOLOCATION,
+                            &value))
+      source_audio_location = value;
+
+    int sink_supported_context_type = 0;
+    if (btif_config_get_int(
+            name, BTIF_STORAGE_LEAUDIO_SINK_SUPPORTED_CONTEXT_TYPE, &value))
+      sink_supported_context_type = value;
+
+    int source_supported_context_type = 0;
+    if (btif_config_get_int(
+            name, BTIF_STORAGE_LEAUDIO_SOURCE_SUPPORTED_CONTEXT_TYPE, &value))
+      source_supported_context_type = value;
+
+    size_t buffer_size =
+        btif_config_get_bin_length(name, BTIF_STORAGE_LEAUDIO_HANDLES_BIN);
+    std::vector<uint8_t> handles(buffer_size);
+    if (buffer_size > 0) {
+      btif_config_get_bin(name, BTIF_STORAGE_LEAUDIO_HANDLES_BIN,
+                          handles.data(), &buffer_size);
+    }
+
+    buffer_size =
+        btif_config_get_bin_length(name, BTIF_STORAGE_LEAUDIO_SINK_PACS_BIN);
+    std::vector<uint8_t> sink_pacs(buffer_size);
+    if (buffer_size > 0) {
+      btif_config_get_bin(name, BTIF_STORAGE_LEAUDIO_SINK_PACS_BIN,
+                          sink_pacs.data(), &buffer_size);
+    }
+
+    buffer_size =
+        btif_config_get_bin_length(name, BTIF_STORAGE_LEAUDIO_SOURCE_PACS_BIN);
+    std::vector<uint8_t> source_pacs(buffer_size);
+    if (buffer_size > 0) {
+      btif_config_get_bin(name, BTIF_STORAGE_LEAUDIO_SOURCE_PACS_BIN,
+                          source_pacs.data(), &buffer_size);
+    }
+
+    buffer_size =
+        btif_config_get_bin_length(name, BTIF_STORAGE_LEAUDIO_ASES_BIN);
+    std::vector<uint8_t> ases(buffer_size);
+    if (buffer_size > 0) {
+      btif_config_get_bin(name, BTIF_STORAGE_LEAUDIO_ASES_BIN, ases.data(),
+                          &buffer_size);
+    }
+
     do_in_main_thread(
-        FROM_HERE, Bind(&LeAudioClient::AddFromStorage, bd_addr, autoconnect));
+        FROM_HERE,
+        Bind(&LeAudioClient::AddFromStorage, bd_addr, autoconnect,
+             sink_audio_location, source_audio_location,
+             sink_supported_context_type, source_supported_context_type,
+             std::move(handles), std::move(sink_pacs), std::move(source_pacs),
+             std::move(ases)));
   }
 }
 
@@ -1809,6 +2079,146 @@ void btif_storage_load_bonded_leaudio() {
 void btif_storage_remove_leaudio(const RawAddress& address) {
   std::string addrstr = address.ToString();
   btif_config_set_int(addrstr, BTIF_STORAGE_LEAUDIO_AUTOCONNECT, false);
+}
+
+constexpr char HAS_IS_ACCEPTLISTED[] = "LeAudioHasIsAcceptlisted";
+constexpr char HAS_FEATURES[] = "LeAudioHasFlags";
+constexpr char HAS_ACTIVE_PRESET[] = "LeAudioHasActivePreset";
+constexpr char HAS_SERIALIZED_PRESETS[] = "LeAudioHasSerializedPresets";
+
+void btif_storage_add_leaudio_has_device(const RawAddress& address,
+                                         std::vector<uint8_t> presets_bin,
+                                         uint8_t features,
+                                         uint8_t active_preset) {
+  do_in_jni_thread(
+      FROM_HERE,
+      Bind(
+          [](const RawAddress& address, std::vector<uint8_t> presets_bin,
+             uint8_t features, uint8_t active_preset) {
+            const std::string& name = address.ToString();
+
+            btif_config_set_int(name, HAS_FEATURES, features);
+            btif_config_set_int(name, HAS_ACTIVE_PRESET, active_preset);
+            btif_config_set_bin(name, HAS_SERIALIZED_PRESETS,
+                                presets_bin.data(), presets_bin.size());
+
+            btif_config_set_int(name, HAS_IS_ACCEPTLISTED, true);
+            btif_config_save();
+          },
+          address, std::move(presets_bin), features, active_preset));
+}
+
+void btif_storage_set_leaudio_has_active_preset(const RawAddress& address,
+                                                uint8_t active_preset) {
+  do_in_jni_thread(FROM_HERE,
+                   Bind(
+                       [](const RawAddress& address, uint8_t active_preset) {
+                         const std::string& name = address.ToString();
+
+                         btif_config_set_int(name, HAS_ACTIVE_PRESET,
+                                             active_preset);
+                         btif_config_save();
+                       },
+                       address, active_preset));
+}
+
+bool btif_storage_get_leaudio_has_features(const RawAddress& address,
+                                           uint8_t& features) {
+  std::string name = address.ToString();
+
+  int value;
+  if (!btif_config_get_int(name, HAS_FEATURES, &value)) return false;
+
+  features = value;
+  return true;
+}
+
+void btif_storage_set_leaudio_has_features(const RawAddress& address,
+                                           uint8_t features) {
+  do_in_jni_thread(FROM_HERE,
+                   Bind(
+                       [](const RawAddress& address, uint8_t features) {
+                         const std::string& name = address.ToString();
+
+                         btif_config_set_int(name, HAS_FEATURES, features);
+                         btif_config_save();
+                       },
+                       address, features));
+}
+
+void btif_storage_load_bonded_leaudio_has_devices() {
+  for (const auto& bd_addr : btif_config_get_paired_devices()) {
+    const std::string& name = bd_addr.ToString();
+
+    if (!btif_config_exist(name, HAS_IS_ACCEPTLISTED) &&
+        !btif_config_exist(name, HAS_FEATURES))
+      continue;
+
+    int value;
+    uint16_t is_acceptlisted = 0;
+    if (btif_config_get_int(name, HAS_IS_ACCEPTLISTED, &value))
+      is_acceptlisted = value;
+
+    uint8_t features = 0;
+    if (btif_config_get_int(name, HAS_FEATURES, &value)) features = value;
+
+#ifndef TARGET_FLOSS
+    do_in_main_thread(FROM_HERE, Bind(&le_audio::has::HasClient::AddFromStorage,
+                                      bd_addr, features, is_acceptlisted));
+#else
+    ASSERT_LOG(false, "TODO - Fix LE audio build.");
+#endif
+  }
+}
+
+void btif_storage_remove_leaudio_has(const RawAddress& address) {
+  std::string addrstr = address.ToString();
+  btif_config_remove(addrstr, HAS_IS_ACCEPTLISTED);
+  btif_config_remove(addrstr, HAS_FEATURES);
+  btif_config_remove(addrstr, HAS_ACTIVE_PRESET);
+  btif_config_remove(addrstr, HAS_SERIALIZED_PRESETS);
+  btif_config_save();
+}
+
+void btif_storage_set_leaudio_has_acceptlist(const RawAddress& address,
+                                             bool add_to_acceptlist) {
+  std::string addrstr = address.ToString();
+
+  btif_config_set_int(addrstr, HAS_IS_ACCEPTLISTED, add_to_acceptlist);
+  btif_config_save();
+}
+
+void btif_storage_set_leaudio_has_presets(const RawAddress& address,
+                                          std::vector<uint8_t> presets_bin) {
+  do_in_jni_thread(
+      FROM_HERE,
+      Bind(
+          [](const RawAddress& address, std::vector<uint8_t> presets_bin) {
+            const std::string& name = address.ToString();
+
+            btif_config_set_bin(name, HAS_SERIALIZED_PRESETS,
+                                presets_bin.data(), presets_bin.size());
+            btif_config_save();
+          },
+          address, std::move(presets_bin)));
+}
+
+bool btif_storage_get_leaudio_has_presets(const RawAddress& address,
+                                          std::vector<uint8_t>& presets_bin,
+                                          uint8_t& active_preset) {
+  std::string name = address.ToString();
+
+  int value;
+  if (!btif_config_get_int(name, HAS_ACTIVE_PRESET, &value)) return false;
+  active_preset = value;
+
+  auto bin_sz = btif_config_get_bin_length(name, HAS_SERIALIZED_PRESETS);
+  presets_bin.resize(bin_sz);
+  if (!btif_config_get_bin(name, HAS_SERIALIZED_PRESETS, presets_bin.data(),
+                           &bin_sz))
+    return false;
+
+  return true;
 }
 
 /** Adds the bonded Le Audio device grouping info into the NVRAM */
@@ -2103,4 +2513,31 @@ void btif_storage_remove_gatt_cl_db_hash(const RawAddress& bd_addr) {
                          }
                        },
                        bd_addr));
+}
+
+void btif_debug_linkkey_type_dump(int fd) {
+  dprintf(fd, "\nLink Key Types:\n");
+  for (const auto& bd_addr : btif_config_get_paired_devices()) {
+    auto bdstr = bd_addr.ToString();
+    int linkkey_type;
+    dprintf(fd, "  %s\n", bdstr.c_str());
+
+    dprintf(fd, "    BR: ");
+    if (btif_config_get_int(bdstr, "LinkKeyType", &linkkey_type)) {
+      dprintf(fd, "%s", linkkey_type_text(linkkey_type).c_str());
+    }
+    dprintf(fd, "\n");
+
+    dprintf(fd, "    LE:");
+    if (btif_config_exist(bdstr, "LE_KEY_PENC")) dprintf(fd, " PENC");
+    if (btif_config_exist(bdstr, "LE_KEY_PID")) dprintf(fd, " PID");
+    if (btif_config_exist(bdstr, "LE_KEY_PCSRK")) dprintf(fd, " PCSRK");
+    if (btif_config_exist(bdstr, "LE_KEY_PLK")) dprintf(fd, " PLK");
+    if (btif_config_exist(bdstr, "LE_KEY_LENC")) dprintf(fd, " LENC");
+    if (btif_config_exist(bdstr, "LE_KEY_LCSRK")) dprintf(fd, " LCSRK");
+    if (btif_config_exist(bdstr, "LE_KEY_LID")) dprintf(fd, " LID");
+    if (btif_config_exist(bdstr, "LE_KEY_PLK")) dprintf(fd, " LLK");
+
+    dprintf(fd, "\n");
+  }
 }

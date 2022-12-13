@@ -76,7 +76,8 @@ static void bt_jni_msg_ready(void* context);
 #elif defined(OS_GENERIC)
 #define BTE_DID_CONF_FILE "bt_did.conf"
 #else  // !defined(OS_GENERIC)
-#define BTE_DID_CONF_FILE "/etc/bluetooth/bt_did.conf"
+#define BTE_DID_CONF_FILE \
+  "/apex/com.android.btservices/etc/bluetooth/bt_did.conf"
 #endif  // defined(OS_GENERIC)
 #endif  // BTE_DID_CONF_FILE
 
@@ -439,7 +440,7 @@ static bt_status_t btif_in_get_adapter_properties(void) {
 
   /* DISC_TIMEOUT */
   BTIF_STORAGE_FILL_PROPERTY(&properties[num_props],
-                             BT_PROPERTY_ADAPTER_DISCOVERY_TIMEOUT,
+                             BT_PROPERTY_ADAPTER_DISCOVERABLE_TIMEOUT,
                              sizeof(disc_timeout), &disc_timeout);
   btif_storage_get_adapter_property(&properties[num_props]);
   num_props++;
@@ -622,6 +623,11 @@ void btif_get_adapter_property(bt_property_type_t type) {
         controller->supports_ble_periodic_advertising_sync_transfer_sender();
     local_le_features.le_connected_isochronous_stream_central_supported =
         controller->supports_ble_connected_isochronous_stream_central();
+    local_le_features.le_isochronous_broadcast_supported =
+        controller->supports_ble_isochronous_broadcaster();
+    local_le_features
+        .le_periodic_advertising_sync_transfer_recipient_supported =
+        controller->supports_ble_periodic_advertising_sync_transfer_recipient();
     memcpy(prop.val, &local_le_features, prop.len);
   } else if (prop.type == BT_PROPERTY_DYNAMIC_AUDIO_BUFFER) {
     tBTM_BLE_VSC_CB cmn_vsc_cb;
@@ -703,7 +709,7 @@ void btif_set_adapter_property(bt_property_t* property) {
 
       BTIF_TRACE_EVENT("set property name : %s", (char*)bd_name);
 
-      BTA_DmSetDeviceName((char*)bd_name);
+      BTA_DmSetDeviceName((const char*)bd_name);
 
       btif_core_storage_adapter_write(property);
     } break;
@@ -716,7 +722,7 @@ void btif_set_adapter_property(bt_property_t* property) {
         btif_core_storage_adapter_write(property);
       }
     } break;
-    case BT_PROPERTY_ADAPTER_DISCOVERY_TIMEOUT: {
+    case BT_PROPERTY_ADAPTER_DISCOVERABLE_TIMEOUT: {
       /* Nothing to do beside store the value in NV.  Java
          will change the SCAN_MODE property after setting timeout,
          if required */

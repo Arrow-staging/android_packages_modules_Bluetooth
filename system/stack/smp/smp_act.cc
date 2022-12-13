@@ -31,6 +31,7 @@
 #include "stack/btm/btm_sec.h"
 #include "stack/include/acl_api.h"
 #include "stack/include/bt_octets.h"
+#include "stack/include/btm_log_history.h"
 #include "stack/include/l2c_api.h"
 #include "stack/include/smp_api_types.h"
 #include "stack/smp/p_256_ecc_pp.h"
@@ -38,6 +39,10 @@
 #include "types/raw_address.h"
 
 extern tBTM_CB btm_cb;
+
+namespace {
+constexpr char kBtmLogTag[] = "SMP";
+}
 
 #define SMP_KEY_DIST_TYPE_MAX 4
 
@@ -133,6 +138,10 @@ void smp_send_app_cback(tSMP_CB* p_cb, tSMP_INT_DATA* p_data) {
         cb_data.io_req.resp_keys = SMP_BR_SEC_DEFAULT_KEY;
         break;
 
+      case SMP_LE_ADDR_ASSOC_EVT:
+        cb_data.id_addr = p_cb->id_addr;
+        break;
+
       default:
         LOG_ERROR("Unexpected event:%hhu", p_cb->cb_evt);
         break;
@@ -207,6 +216,7 @@ void smp_send_app_cback(tSMP_CB* p_cb, tSMP_INT_DATA* p_data) {
 
         // Expected, but nothing to do
         case SMP_SC_LOC_OOB_DATA_UP_EVT:
+        case SMP_LE_ADDR_ASSOC_EVT:
           break;
 
         default:
@@ -229,11 +239,13 @@ void smp_send_pair_fail(tSMP_CB* p_cb, tSMP_INT_DATA* p_data) {
   p_cb->status = p_data->status;
   p_cb->failure = p_data->status;
 
-  SMP_TRACE_DEBUG("%s: status=%d failure=%d ", __func__, p_cb->status,
-                  p_cb->failure);
-
   if (p_cb->status <= SMP_MAX_FAIL_RSN_PER_SPEC &&
       p_cb->status != SMP_SUCCESS) {
+    LOG_ERROR("Pairing failed smp_status:%s",
+              smp_status_text(p_cb->status).c_str());
+    BTM_LogHistory(kBtmLogTag, p_cb->pairing_bda, "Pairing failed",
+                   base::StringPrintf("smp_status:%s",
+                                      smp_status_text(p_cb->status).c_str()));
     smp_send_cmd(SMP_OPCODE_PAIRING_FAILED, p_cb);
     p_cb->wait_for_authorization_complete = true;
   }
@@ -536,6 +548,14 @@ void smp_proc_pair_cmd(tSMP_CB* p_cb, tSMP_INT_DATA* p_data) {
   STREAM_TO_UINT8(p_cb->peer_enc_size, p);
   STREAM_TO_UINT8(p_cb->peer_i_key, p);
   STREAM_TO_UINT8(p_cb->peer_r_key, p);
+
+  tSMP_STATUS reason = p_cb->cert_failure;
+  if (reason == SMP_ENC_KEY_SIZE) {
+    tSMP_INT_DATA smp_int_data;
+    smp_int_data.status = reason;
+    smp_sm_event(p_cb, SMP_AUTH_CMPL_EVT, &smp_int_data);
+    return;
+  }
 
   if (smp_command_has_invalid_parameters(p_cb)) {
     tSMP_INT_DATA smp_int_data;
@@ -895,15 +915,6 @@ void smp_br_check_authorization_request(tSMP_CB* p_cb, tSMP_INT_DATA* p_data) {
   }
   SMP_TRACE_DEBUG("%s: use h7 = %d", __func__, p_cb->key_derivation_h7_used);
 
-  /* SMP over BR/EDR should always be used with CTKD, so derive LTK from
-   * LK before receiving keys */
-  if ((p_cb->role == HCI_ROLE_CENTRAL &&
-       (p_cb->local_i_key & SMP_SEC_KEY_TYPE_ENC)) ||
-      (p_cb->role == HCI_ROLE_PERIPHERAL &&
-       (p_cb->local_r_key & SMP_SEC_KEY_TYPE_ENC))) {
-    smp_generate_ltk(p_cb, p_data);
-  }
-
   SMP_TRACE_DEBUG(
       "%s rcvs upgrades: i_keys=0x%x r_keys=0x%x (i-initiator r-responder)",
       __func__, p_cb->local_i_key, p_cb->local_r_key);
@@ -1023,7 +1034,7 @@ void smp_proc_id_info(tSMP_CB* p_cb, tSMP_INT_DATA* p_data) {
 
 /** process identity address from peer device */
 void smp_proc_id_addr(tSMP_CB* p_cb, tSMP_INT_DATA* p_data) {
-  uint8_t* p = p_data->p_data;
+  const uint8_t* p = p_data->p_data;
 
   SMP_TRACE_DEBUG("%s", __func__);
 
@@ -1052,8 +1063,11 @@ void smp_proc_id_addr(tSMP_CB* p_cb, tSMP_INT_DATA* p_data) {
 
   /* store the ID key from peer device */
   if ((p_cb->peer_auth_req & SMP_AUTH_BOND) &&
-      (p_cb->loc_auth_req & SMP_AUTH_BOND))
+      (p_cb->loc_auth_req & SMP_AUTH_BOND)) {
     btm_sec_save_le_key(p_cb->pairing_bda, BTM_LE_KEY_PID, &pid_key, true);
+    p_cb->cb_evt = SMP_LE_ADDR_ASSOC_EVT;
+    smp_send_app_cback(p_cb, NULL);
+  }
   smp_key_distribution_by_transport(p_cb, NULL);
 }
 

@@ -35,6 +35,10 @@ rust_library {
     proc_macros: [
         "libnum_derive",
     ],
+    apex_available: [
+        "com.android.bluetooth",
+    ],
+    min_sdk_version: "30",
     target: {
         android: {
             whole_static_libs: ["libbt_hidl_hal_cxx"],
@@ -50,7 +54,10 @@ rust_library {
 
 rust_test_host {
     name: "libbluetooth_rs_test",
-    defaults: ["gd_rust_defaults"],
+    defaults: [
+        "gd_rust_defaults",
+        "mts_defaults",
+    ],
     srcs: ["src/lib.rs"],
     test_suites: ["general-tests"],
     edition: "2018",
@@ -108,5 +115,9 @@ cc_library_static {
         "libhidlbase",
         "libutils",
     ],
+    apex_available: [
+        "com.android.bluetooth",
+    ],
+    min_sdk_version: "30",
 }
 

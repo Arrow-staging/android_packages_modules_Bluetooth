@@ -65,6 +65,8 @@ void bond_state_changed_callback(bt_status_t status, RawAddress* remote_bd_addr,
                                  bt_bond_state_t state, int fail_reason) {}
 void address_consolidate_callback(RawAddress* main_bd_addr,
                                   RawAddress* secondary_bd_addr) {}
+void le_address_associate_callback(RawAddress* main_bd_addr,
+                                   RawAddress* secondary_bd_addr) {}
 void acl_state_changed_callback(bt_status_t status, RawAddress* remote_bd_addr,
                                 bt_acl_state_t state, int transport_link_type,
                                 bt_hci_error_code_t hci_reason) {}
@@ -79,6 +81,8 @@ void energy_info_callback(bt_activity_energy_info* energy_info,
                           bt_uid_traffic_t* uid_data) {}
 void generate_local_oob_data_callback(tBT_TRANSPORT transport,
                                       bt_oob_data_t oob_data) {}
+void switch_buffer_size_callback(bool is_low_latency_buffer_size) {}
+void switch_codec_callback(bool is_low_latency_buffer_size) {}
 #undef TESTCB
 
 bt_callbacks_t callbacks = {
@@ -92,6 +96,7 @@ bt_callbacks_t callbacks = {
     .ssp_request_cb = ssp_request_callback,
     .bond_state_changed_cb = bond_state_changed_callback,
     .address_consolidate_cb = address_consolidate_callback,
+    .le_address_associate_cb = le_address_associate_callback,
     .acl_state_changed_cb = acl_state_changed_callback,
     .thread_evt_cb = callback_thread_event,
     .dut_mode_recv_cb = dut_mode_recv_callback,
@@ -99,6 +104,8 @@ bt_callbacks_t callbacks = {
     .energy_info_cb = energy_info_callback,
     .link_quality_report_cb = link_quality_report_callback,
     .generate_local_oob_data_cb = generate_local_oob_data_callback,
+    .switch_buffer_size_cb = switch_buffer_size_callback,
+    .switch_codec_cb = switch_codec_callback,
 };
 
 }  // namespace

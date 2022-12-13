@@ -29,13 +29,13 @@
 #include <string.h>
 
 #include "common/time_util.h"
-#include "l2c_api.h"
-#include "l2c_int.h"
-#include "l2cdefs.h"
 #include "osi/include/allocator.h"
 #include "osi/include/log.h"
 #include "stack/include/bt_hdr.h"
 #include "stack/include/bt_types.h"
+#include "stack/include/l2c_api.h"
+#include "stack/include/l2cdefs.h"
+#include "stack/l2cap/l2c_int.h"
 
 /* Flag passed to retransmit_i_frames() when all packets should be retransmitted
  */
@@ -681,8 +681,12 @@ void l2c_lcc_proc_pdu(tL2C_CCB* p_ccb, BT_HDR* p_buf) {
 
   /* Buffer length should not exceed local mps */
   if (p_buf->len > p_ccb->local_conn_cfg.mps) {
-    /* Discard the buffer */
+    LOG_ERROR("buffer length=%d exceeds local mps=%d. Drop and disconnect.",
+              p_buf->len, p_ccb->local_conn_cfg.mps);
+
+    /* Discard the buffer and disconnect*/
     osi_free(p_buf);
+    l2cu_disconnect_chnl(p_ccb);
     return;
   }
 
@@ -699,8 +703,11 @@ void l2c_lcc_proc_pdu(tL2C_CCB* p_ccb, BT_HDR* p_buf) {
 
     /* Check the SDU Length with local MTU size */
     if (sdu_length > p_ccb->local_conn_cfg.mtu) {
-      /* Discard the buffer */
+      LOG_ERROR("sdu length=%d exceeds local mtu=%d. Drop and disconnect.",
+                sdu_length, p_ccb->local_conn_cfg.mtu);
+      /* Discard the buffer and disconnect*/
       osi_free(p_buf);
+      l2cu_disconnect_chnl(p_ccb);
       return;
     }
 

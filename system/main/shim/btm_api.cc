@@ -37,9 +37,11 @@
 #include "main/shim/shim.h"
 #include "main/shim/stack.h"
 #include "osi/include/allocator.h"
+#include "stack/btm/btm_ble_int.h"
 #include "stack/btm/btm_int_types.h"
 #include "stack/include/bt_hdr.h"
 #include "stack/include/bt_octets.h"
+#include "types/ble_address_with_type.h"
 #include "types/bluetooth/uuid.h"
 #include "types/raw_address.h"
 
@@ -71,7 +73,7 @@ extern void btm_clear_all_pending_le_entry(void);
 extern void btm_clr_inq_result_flt(void);
 extern void btm_set_eir_uuid(const uint8_t* p_eir, tBTM_INQ_RESULTS* p_results);
 extern void btm_sort_inq_result(void);
-extern void btm_process_inq_complete(uint8_t status, uint8_t result_type);
+extern void btm_process_inq_complete(tHCI_STATUS status, uint8_t result_type);
 
 static bool is_classic_device(tBT_DEVICE_TYPE device_type) {
   return device_type == BT_DEVICE_TYPE_BREDR;
@@ -465,19 +467,10 @@ class ShimBondListener : public bluetooth::security::ISecurityManagerListener {
             bluetooth::ToRawAddress(device.GetAddress()), 0, name, HCI_SUCCESS);
       }
     }
-    bool is_gd_enabled = bluetooth::shim::is_any_gd_enabled();
-    if (is_gd_enabled) {
-      bluetooth::shim::AllocateIdFromMetricIdAllocator(
-          bluetooth::ToRawAddress(device.GetAddress()));
-    } else {
-      MetricIdAllocator::GetInstance().AllocateId(
-          bluetooth::ToRawAddress(device.GetAddress()));
-    }
-    bool is_saving_successful =
-        is_gd_enabled ? bluetooth::shim::SaveDeviceOnMetricIdAllocator(
-                            bluetooth::ToRawAddress(device.GetAddress()))
-                      : MetricIdAllocator::GetInstance().SaveDevice(
-                            bluetooth::ToRawAddress(device.GetAddress()));
+    bluetooth::shim::AllocateIdFromMetricIdAllocator(
+        bluetooth::ToRawAddress(device.GetAddress()));
+    bool is_saving_successful = bluetooth::shim::SaveDeviceOnMetricIdAllocator(
+        bluetooth::ToRawAddress(device.GetAddress()));
     if (!is_saving_successful) {
       LOG(FATAL) << __func__ << ": Fail to save metric id for device "
                  << bluetooth::ToRawAddress(device.GetAddress());
@@ -488,13 +481,8 @@ class ShimBondListener : public bluetooth::security::ISecurityManagerListener {
     if (bta_callbacks_->p_bond_cancel_cmpl_callback) {
       (*bta_callbacks_->p_bond_cancel_cmpl_callback)(BTM_SUCCESS);
     }
-    if (bluetooth::shim::is_any_gd_enabled()) {
-      bluetooth::shim::ForgetDeviceFromMetricIdAllocator(
-          bluetooth::ToRawAddress(device.GetAddress()));
-    } else {
-      MetricIdAllocator::GetInstance().ForgetDevice(
-          bluetooth::ToRawAddress(device.GetAddress()));
-    }
+    bluetooth::shim::ForgetDeviceFromMetricIdAllocator(
+        bluetooth::ToRawAddress(device.GetAddress()));
   }
 
   void OnDeviceBondFailed(bluetooth::hci::AddressWithType device,
@@ -892,13 +880,6 @@ tBTM_STATUS bluetooth::shim::BTM_ClearInqDb(const RawAddress* p_bda) {
   return BTM_NO_RESOURCES;
 }
 
-tBTM_STATUS bluetooth::shim::BTM_WriteEIR(BT_HDR* p_buff) {
-  LOG_INFO("UNIMPLEMENTED %s", __func__);
-  CHECK(p_buff != nullptr);
-  osi_free(p_buff);
-  return BTM_NO_RESOURCES;
-}
-
 bool bluetooth::shim::BTM_HasEirService(const uint32_t* p_eir_uuid,
                                         uint16_t uuid16) {
   LOG_INFO("UNIMPLEMENTED %s", __func__);
@@ -914,12 +895,6 @@ tBTM_EIR_SEARCH_RESULT bluetooth::shim::BTM_HasInquiryEirService(
 }
 
 void bluetooth::shim::BTM_AddEirService(uint32_t* p_eir_uuid, uint16_t uuid16) {
-  LOG_INFO("UNIMPLEMENTED %s", __func__);
-  CHECK(p_eir_uuid != nullptr);
-}
-
-void bluetooth::shim::BTM_RemoveEirService(uint32_t* p_eir_uuid,
-                                           uint16_t uuid16) {
   LOG_INFO("UNIMPLEMENTED %s", __func__);
   CHECK(p_eir_uuid != nullptr);
 }
@@ -1241,7 +1216,8 @@ tBTM_STATUS bluetooth::shim::BTM_SecBondCancel(const RawAddress& bd_addr) {
 }
 
 bool bluetooth::shim::BTM_SecAddDevice(const RawAddress& bd_addr,
-                                       DEV_CLASS dev_class, BD_NAME bd_name,
+                                       DEV_CLASS dev_class,
+                                       const BD_NAME& bd_name,
                                        uint8_t* features, LinkKey* link_key,
                                        uint8_t key_type, uint8_t pin_length) {
   // Check if GD has a security record for the device
@@ -1256,8 +1232,8 @@ void bluetooth::shim::BTM_ConfirmReqReply(tBTM_STATUS res,
                                           const RawAddress& bd_addr) {
   // Send for both Classic and LE until we can determine the type
   bool accept = res == BTM_SUCCESS;
-  hci::AddressWithType address = ToAddressWithType(bd_addr, 0);
-  hci::AddressWithType address2 = ToAddressWithType(bd_addr, 1);
+  hci::AddressWithType address = ToAddressWithType(bd_addr, BLE_ADDR_PUBLIC);
+  hci::AddressWithType address2 = ToAddressWithType(bd_addr, BLE_ADDR_RANDOM);
   auto security_manager =
       bluetooth::shim::GetSecurityModule()->GetSecurityManager();
   if (ShimUi::GetInstance()->waiting_for_pairing_prompt_) {
@@ -1352,5 +1328,15 @@ void bluetooth::shim::BTM_RemoteOobDataReply(tBTM_STATUS res,
 tBTM_STATUS bluetooth::shim::BTM_SetDeviceClass(DEV_CLASS dev_class) {
   // TODO(optedoblivion): see if we need this, I don't think we do
   LOG_WARN("Unimplemented");
+  return BTM_SUCCESS;
+}
+
+tBTM_STATUS bluetooth::shim::BTM_ClearEventFilter() {
+  controller_get_interface()->clear_event_filter();
+  return BTM_SUCCESS;
+}
+
+tBTM_STATUS bluetooth::shim::BTM_BleResetId() {
+  btm_ble_reset_id();
   return BTM_SUCCESS;
 }

@@ -13,11 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <frameworks/proto_logging/stats/enums/bluetooth/enums.pb.h>
+#include "hci/hci_metrics_logging.h"
+
 #include <frameworks/proto_logging/stats/enums/bluetooth/hci/enums.pb.h>
 
+#include "common/audit_log.h"
 #include "common/strings.h"
-#include "hci/hci_metrics_logging.h"
 #include "os/metrics.h"
 #include "storage/device.h"
 
@@ -62,6 +63,176 @@ void log_hci_event(
       log_classic_pairing_other_hci_event(event_view);
   }
 }
+
+void log_link_layer_connection_command(std::unique_ptr<CommandView>& command_view) {
+  // get op_code
+  ASSERT(command_view->IsValid());
+  OpCode op_code = command_view->GetOpCode();
+
+  // init parameters to log
+  Address address = Address::kEmpty;
+  uint32_t connection_handle = bluetooth::os::kUnknownConnectionHandle;
+  uint16_t reason = static_cast<uint16_t>(ErrorCode::UNKNOWN_HCI_COMMAND);
+  static uint16_t kUnknownBleEvt = android::bluetooth::hci::BLE_EVT_UNKNOWN;
+  uint16_t event_code = android::bluetooth::hci::EVT_UNKNOWN;
+  android::bluetooth::DirectionEnum direction = android::bluetooth::DIRECTION_UNKNOWN;
+  uint16_t link_type = android::bluetooth::LINK_TYPE_UNKNOWN;
+  uint16_t status = static_cast<uint16_t>(ErrorCode::STATUS_UNKNOWN);
+
+  // get ConnectionManagementCommandView
+  ConnectionManagementCommandView connection_management_command_view =
+      ConnectionManagementCommandView::Create(AclCommandView::Create(*command_view));
+  ASSERT(connection_management_command_view.IsValid());
+  switch (op_code) {
+    case OpCode::CREATE_CONNECTION: {
+      auto create_connection_view = CreateConnectionView::Create(std::move(connection_management_command_view));
+      ASSERT(create_connection_view.IsValid());
+      address = create_connection_view.GetBdAddr();
+      direction = android::bluetooth::DIRECTION_OUTGOING;
+      link_type = android::bluetooth::LINK_TYPE_ACL;
+      break;
+    }
+    case OpCode::CREATE_CONNECTION_CANCEL: {
+      auto create_connection_cancel_view =
+          CreateConnectionCancelView::Create(std::move(connection_management_command_view));
+      ASSERT(create_connection_cancel_view.IsValid());
+      address = create_connection_cancel_view.GetBdAddr();
+      direction = android::bluetooth::DIRECTION_OUTGOING;
+      link_type = android::bluetooth::LINK_TYPE_ACL;
+      break;
+    }
+    case OpCode::DISCONNECT: {
+      auto disconnect_view = DisconnectView::Create(std::move(connection_management_command_view));
+      ASSERT(disconnect_view.IsValid());
+      connection_handle = disconnect_view.GetConnectionHandle();
+      reason = static_cast<uint16_t>(disconnect_view.GetReason());
+      break;
+    }
+    case OpCode::SETUP_SYNCHRONOUS_CONNECTION: {
+      auto setup_synchronous_connection_view = SetupSynchronousConnectionView::Create(
+          ScoConnectionCommandView::Create(std::move(connection_management_command_view)));
+      ASSERT(setup_synchronous_connection_view.IsValid());
+      connection_handle = setup_synchronous_connection_view.GetConnectionHandle();
+      direction = android::bluetooth::DIRECTION_OUTGOING;
+      break;
+    }
+    case OpCode::ENHANCED_SETUP_SYNCHRONOUS_CONNECTION: {
+      auto enhanced_setup_synchronous_connection_view = EnhancedSetupSynchronousConnectionView::Create(
+          ScoConnectionCommandView::Create(std::move(connection_management_command_view)));
+      ASSERT(enhanced_setup_synchronous_connection_view.IsValid());
+      connection_handle = enhanced_setup_synchronous_connection_view.GetConnectionHandle();
+      direction = android::bluetooth::DIRECTION_OUTGOING;
+      break;
+    }
+    case OpCode::ACCEPT_CONNECTION_REQUEST: {
+      auto accept_connection_request_view =
+          AcceptConnectionRequestView::Create(std::move(connection_management_command_view));
+      ASSERT(accept_connection_request_view.IsValid());
+      address = accept_connection_request_view.GetBdAddr();
+      direction = android::bluetooth::DIRECTION_INCOMING;
+      break;
+    }
+    case OpCode::ACCEPT_SYNCHRONOUS_CONNECTION: {
+      auto accept_synchronous_connection_view = AcceptSynchronousConnectionView::Create(
+          ScoConnectionCommandView::Create(std::move(connection_management_command_view)));
+      ASSERT(accept_synchronous_connection_view.IsValid());
+      address = accept_synchronous_connection_view.GetBdAddr();
+      direction = android::bluetooth::DIRECTION_INCOMING;
+      break;
+    }
+    case OpCode::ENHANCED_ACCEPT_SYNCHRONOUS_CONNECTION: {
+      auto enhanced_accept_synchronous_connection_view = EnhancedAcceptSynchronousConnectionView::Create(
+          ScoConnectionCommandView::Create(std::move(connection_management_command_view)));
+      ASSERT(enhanced_accept_synchronous_connection_view.IsValid());
+      address = enhanced_accept_synchronous_connection_view.GetBdAddr();
+      direction = android::bluetooth::DIRECTION_INCOMING;
+      break;
+    }
+    case OpCode::REJECT_CONNECTION_REQUEST: {
+      auto reject_connection_request_view =
+          RejectConnectionRequestView::Create(std::move(connection_management_command_view));
+      ASSERT(reject_connection_request_view.IsValid());
+      address = reject_connection_request_view.GetBdAddr();
+      reason = static_cast<uint16_t>(reject_connection_request_view.GetReason());
+      direction = android::bluetooth::DIRECTION_INCOMING;
+      break;
+    }
+    case OpCode::REJECT_SYNCHRONOUS_CONNECTION: {
+      auto reject_synchronous_connection_view = RejectSynchronousConnectionView::Create(
+          ScoConnectionCommandView::Create(std::move(connection_management_command_view)));
+      ASSERT(reject_synchronous_connection_view.IsValid());
+      address = reject_synchronous_connection_view.GetBdAddr();
+      reason = static_cast<uint16_t>(reject_synchronous_connection_view.GetReason());
+      direction = android::bluetooth::DIRECTION_INCOMING;
+      break;
+    }
+    case OpCode::LE_CREATE_CONNECTION: {
+      auto le_create_connection_view = LeCreateConnectionView::Create(
+          LeConnectionManagementCommandView::Create(std::move(connection_management_command_view)));
+      ASSERT(le_create_connection_view.IsValid());
+      address = le_create_connection_view.GetPeerAddress();
+      direction = android::bluetooth::DIRECTION_INCOMING;
+      link_type = android::bluetooth::LINK_TYPE_ACL;
+      break;
+    }
+    case OpCode::LE_EXTENDED_CREATE_CONNECTION: {
+      auto le_extended_create_connection_view = LeExtendedCreateConnectionView::Create(
+          LeConnectionManagementCommandView::Create(std::move(connection_management_command_view)));
+      ASSERT(le_extended_create_connection_view.IsValid());
+      address = le_extended_create_connection_view.GetPeerAddress();
+      direction = android::bluetooth::DIRECTION_OUTGOING;
+      link_type = android::bluetooth::LINK_TYPE_ACL;
+      break;
+    }
+    case OpCode::LE_CREATE_CONNECTION_CANCEL: {
+      auto le_create_connection_cancel_view = LeCreateConnectionCancelView::Create(
+          LeConnectionManagementCommandView::Create(std::move(connection_management_command_view)));
+      ASSERT(le_create_connection_cancel_view.IsValid());
+      direction = android::bluetooth::DIRECTION_OUTGOING;
+      link_type = android::bluetooth::LINK_TYPE_ACL;
+      break;
+    }
+    case OpCode::LE_CLEAR_FILTER_ACCEPT_LIST: {
+      auto le_clear_connect_list_view = LeClearFilterAcceptListView::Create(
+          LeConnectionManagementCommandView::Create(std::move(connection_management_command_view)));
+      ASSERT(le_clear_connect_list_view.IsValid());
+      direction = android::bluetooth::DIRECTION_INCOMING;
+      link_type = android::bluetooth::LINK_TYPE_ACL;
+      break;
+    }
+    case OpCode::LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST: {
+      auto le_add_device_to_connect_list_view = LeAddDeviceToFilterAcceptListView::Create(
+          LeConnectionManagementCommandView::Create(std::move(connection_management_command_view)));
+      ASSERT(le_add_device_to_connect_list_view.IsValid());
+      address = le_add_device_to_connect_list_view.GetAddress();
+      direction = android::bluetooth::DIRECTION_INCOMING;
+      link_type = android::bluetooth::LINK_TYPE_ACL;
+      break;
+    }
+    case OpCode::LE_REMOVE_DEVICE_FROM_FILTER_ACCEPT_LIST: {
+      auto le_remove_device_from_connect_list_view = LeRemoveDeviceFromFilterAcceptListView::Create(
+          LeConnectionManagementCommandView::Create(std::move(connection_management_command_view)));
+      ASSERT(le_remove_device_from_connect_list_view.IsValid());
+      address = le_remove_device_from_connect_list_view.GetAddress();
+      direction = android::bluetooth::DIRECTION_INCOMING;
+      link_type = android::bluetooth::LINK_TYPE_ACL;
+      break;
+    }
+    default:
+      return;
+  }
+  os::LogMetricLinkLayerConnectionEvent(
+      &address,
+      connection_handle,
+      direction,
+      link_type,
+      static_cast<uint32_t>(op_code),
+      static_cast<uint16_t>(event_code),
+      kUnknownBleEvt,
+      status,
+      static_cast<uint16_t>(reason));
+}
+
 void log_link_layer_connection_command_status(std::unique_ptr<CommandView>& command_view, ErrorCode status) {
   // get op_code
   ASSERT(command_view->IsValid());
@@ -201,16 +372,16 @@ void log_link_layer_connection_command_status(std::unique_ptr<CommandView>& comm
       link_type = android::bluetooth::LINK_TYPE_ACL;
       break;
     }
-    case OpCode::LE_CLEAR_CONNECT_LIST: {
-      auto le_clear_connect_list_view = LeClearConnectListView::Create(
+    case OpCode::LE_CLEAR_FILTER_ACCEPT_LIST: {
+      auto le_clear_connect_list_view = LeClearFilterAcceptListView::Create(
           LeConnectionManagementCommandView::Create(std::move(connection_management_command_view)));
       ASSERT(le_clear_connect_list_view.IsValid());
       direction = android::bluetooth::DIRECTION_INCOMING;
       link_type = android::bluetooth::LINK_TYPE_ACL;
       break;
     }
-    case OpCode::LE_ADD_DEVICE_TO_CONNECT_LIST: {
-      auto le_add_device_to_connect_list_view = LeAddDeviceToConnectListView::Create(
+    case OpCode::LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST: {
+      auto le_add_device_to_connect_list_view = LeAddDeviceToFilterAcceptListView::Create(
           LeConnectionManagementCommandView::Create(std::move(connection_management_command_view)));
       ASSERT(le_add_device_to_connect_list_view.IsValid());
       address = le_add_device_to_connect_list_view.GetAddress();
@@ -218,8 +389,8 @@ void log_link_layer_connection_command_status(std::unique_ptr<CommandView>& comm
       link_type = android::bluetooth::LINK_TYPE_ACL;
       break;
     }
-    case OpCode::LE_REMOVE_DEVICE_FROM_CONNECT_LIST: {
-      auto le_remove_device_from_connect_list_view = LeRemoveDeviceFromConnectListView::Create(
+    case OpCode::LE_REMOVE_DEVICE_FROM_FILTER_ACCEPT_LIST: {
+      auto le_remove_device_from_connect_list_view = LeRemoveDeviceFromFilterAcceptListView::Create(
           LeConnectionManagementCommandView::Create(std::move(connection_management_command_view)));
       ASSERT(le_remove_device_from_connect_list_view.IsValid());
       address = le_remove_device_from_connect_list_view.GetAddress();
@@ -263,16 +434,16 @@ void log_link_layer_connection_command_complete(EventView event_view, std::uniqu
   ASSERT(connection_management_command_view.IsValid());
 
   switch (op_code) {
-    case OpCode::LE_CLEAR_CONNECT_LIST: {
-      auto le_clear_connect_list_view = LeClearConnectListView::Create(
+    case OpCode::LE_CLEAR_FILTER_ACCEPT_LIST: {
+      auto le_clear_connect_list_view = LeClearFilterAcceptListView::Create(
           LeConnectionManagementCommandView::Create(std::move(connection_management_command_view)));
       ASSERT(le_clear_connect_list_view.IsValid());
       direction = android::bluetooth::DIRECTION_INCOMING;
       link_type = android::bluetooth::LINK_TYPE_ACL;
       break;
     }
-    case OpCode::LE_ADD_DEVICE_TO_CONNECT_LIST: {
-      auto le_add_device_to_connect_list_view = LeAddDeviceToConnectListView::Create(
+    case OpCode::LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST: {
+      auto le_add_device_to_connect_list_view = LeAddDeviceToFilterAcceptListView::Create(
           LeConnectionManagementCommandView::Create(std::move(connection_management_command_view)));
       ASSERT(le_add_device_to_connect_list_view.IsValid());
       address = le_add_device_to_connect_list_view.GetAddress();
@@ -280,8 +451,8 @@ void log_link_layer_connection_command_complete(EventView event_view, std::uniqu
       link_type = android::bluetooth::LINK_TYPE_ACL;
       break;
     }
-    case OpCode::LE_REMOVE_DEVICE_FROM_CONNECT_LIST: {
-      auto le_remove_device_from_connect_list_view = LeRemoveDeviceFromConnectListView::Create(
+    case OpCode::LE_REMOVE_DEVICE_FROM_FILTER_ACCEPT_LIST: {
+      auto le_remove_device_from_connect_list_view = LeRemoveDeviceFromFilterAcceptListView::Create(
           LeConnectionManagementCommandView::Create(std::move(connection_management_command_view)));
       ASSERT(le_remove_device_from_connect_list_view.IsValid());
       address = le_remove_device_from_connect_list_view.GetAddress();
@@ -342,7 +513,16 @@ void log_link_layer_connection_other_hci_event(EventView packet, storage::Storag
       status = connection_complete_view.GetStatus();
 
       // besides log link layer connection events, also log remote device manufacturer info
-      log_remote_device_information(address, connection_handle, status, storage_module);
+      log_remote_device_information(
+          address,
+          android::bluetooth::ADDRESS_TYPE_PUBLIC,
+          connection_handle,
+          status,
+          storage_module);
+
+      if (status != ErrorCode::SUCCESS) {
+        common::LogConnectionAdminAuditEvent("Connecting", address, status);
+      }
       break;
     }
     case EventCode::CONNECTION_REQUEST: {
@@ -420,6 +600,12 @@ void log_link_layer_connection_event_le_meta(LeMetaEventView le_meta_event_view)
       static_cast<uint16_t>(leEvt),
       static_cast<uint16_t>(status),
       static_cast<uint16_t>(reason));
+
+  if (status != ErrorCode::SUCCESS && status != ErrorCode::UNKNOWN_CONNECTION) {
+    // ERROR CODE 0x02, unknown connection identifier, means connection attempt was cancelled by host, so probably no
+    // need to log it.
+    common::LogConnectionAdminAuditEvent("Connecting", address, status);
+  }
 }
 
 void log_classic_pairing_other_hci_event(EventView packet) {
@@ -482,7 +668,10 @@ void log_classic_pairing_other_hci_event(EventView packet) {
     }
     case EventCode::REMOTE_OOB_DATA_REQUEST: {
       RemoteOobDataRequestView remote_oob_data_request_view = RemoteOobDataRequestView::Create(std::move(packet));
-      ASSERT(remote_oob_data_request_view.IsValid());
+      if (!remote_oob_data_request_view.IsValid()) {
+        LOG_WARN("remote_oob_data_request_view not valid");
+        return;
+      }
       address = remote_oob_data_request_view.GetBdAddr();
       break;
     }
@@ -495,7 +684,10 @@ void log_classic_pairing_other_hci_event(EventView packet) {
     }
     case EventCode::REMOTE_NAME_REQUEST_COMPLETE: {
       RemoteNameRequestCompleteView remote_name_request_complete_view = RemoteNameRequestCompleteView::Create(std::move(packet));
-      ASSERT(remote_name_request_complete_view.IsValid());
+      if (!remote_name_request_complete_view.IsValid()) {
+        LOG_WARN("remote_name_request_complete_view not valid");
+        return;
+      }
       address = remote_name_request_complete_view.GetBdAddr();
       status = remote_name_request_complete_view.GetStatus();
       break;
@@ -661,14 +853,20 @@ void log_classic_pairing_command_status(std::unique_ptr<CommandView>& command_vi
     case OpCode::REMOTE_OOB_DATA_REQUEST_REPLY: {
       RemoteOobDataRequestReplyView remote_oob_data_request_reply_view
       = RemoteOobDataRequestReplyView::Create(std::move(security_command_view));
-      ASSERT(remote_oob_data_request_reply_view.IsValid());
+      if (!remote_oob_data_request_reply_view.IsValid()) {
+        LOG_WARN("remote_oob_data_request_reply_view is not valid.");
+        return;
+      }
       address = remote_oob_data_request_reply_view.GetBdAddr();
       break;
     }
     case OpCode::REMOTE_OOB_DATA_REQUEST_NEGATIVE_REPLY: {
       RemoteOobDataRequestNegativeReplyView remote_oob_data_request_negative_reply_view
       = RemoteOobDataRequestNegativeReplyView::Create(std::move(security_command_view));
-      ASSERT(remote_oob_data_request_negative_reply_view.IsValid());
+      if (!remote_oob_data_request_negative_reply_view.IsValid()) {
+        LOG_WARN("remote_oob_data_request_negative_reply_view is not valid.");
+        return;
+      }
       address = remote_oob_data_request_negative_reply_view.GetBdAddr();
       break;
     }
@@ -824,19 +1022,31 @@ void log_classic_pairing_command_complete(EventView event_view, std::unique_ptr<
     }
     case OpCode::REMOTE_OOB_DATA_REQUEST_REPLY: {
       auto remote_oob_data_request_reply_complete_view = RemoteOobDataRequestReplyCompleteView::Create(std::move(command_complete_view));
-      ASSERT(remote_oob_data_request_reply_complete_view.IsValid());
+      if (!remote_oob_data_request_reply_complete_view.IsValid()) {
+        LOG_WARN("remote_oob_data_request_reply_complete_view is not valid.");
+        return;
+      }
       status = remote_oob_data_request_reply_complete_view.GetStatus();
       auto remote_oob_data_request_reply_view = RemoteOobDataRequestReplyView::Create(std::move(security_command_view));
-      ASSERT(remote_oob_data_request_reply_view.IsValid());
+      if (!remote_oob_data_request_reply_view.IsValid()) {
+        LOG_WARN("remote_oob_data_request_reply_view is not valid.");
+        return;
+      }
       address = remote_oob_data_request_reply_view.GetBdAddr();
       break;
     }
     case OpCode::REMOTE_OOB_DATA_REQUEST_NEGATIVE_REPLY: {
       auto remote_oob_data_request_negative_reply_complete_view = RemoteOobDataRequestNegativeReplyCompleteView::Create(std::move(command_complete_view));
-      ASSERT(remote_oob_data_request_negative_reply_complete_view.IsValid());
+      if (!remote_oob_data_request_negative_reply_complete_view.IsValid()) {
+        LOG_WARN("remote_oob_data_request_negative_reply_complete_view is not valid.");
+        return;
+      }
       status = remote_oob_data_request_negative_reply_complete_view.GetStatus();
       auto remote_oob_data_request_negative_reply_view = RemoteOobDataRequestNegativeReplyView::Create(std::move(security_command_view));
-      ASSERT(remote_oob_data_request_negative_reply_view.IsValid());
+      if (!remote_oob_data_request_negative_reply_view.IsValid()) {
+        LOG_WARN("remote_oob_data_request_negative_reply_view is not valid.");
+        return;
+      }
       address = remote_oob_data_request_negative_reply_view.GetBdAddr();
       break;
     }
@@ -854,7 +1064,11 @@ void log_classic_pairing_command_complete(EventView event_view, std::unique_ptr<
 }
 
 void log_remote_device_information(
-    const Address& address, uint32_t connection_handle, ErrorCode status, storage::StorageModule* storage_module) {
+    const Address& address,
+    android::bluetooth::AddressTypeEnum address_type,
+    uint32_t connection_handle,
+    ErrorCode status,
+    storage::StorageModule* storage_module) {
   if (address.IsEmpty()) {
     return;
   }
@@ -865,6 +1079,7 @@ void log_remote_device_information(
   sdp_di_vendor_id_source << "N:SDP::DIP::" << common::ToHexString(device.GetSdpDiVendorIdSource().value_or(0)).c_str();
   os::LogMetricManufacturerInfo(
       address,
+      address_type,
       android::bluetooth::DeviceInfoSrcEnum::DEVICE_INFO_INTERNAL,
       sdp_di_vendor_id_source.str(),
       common::ToHexString(device.GetSdpDiManufacturer().value_or(0)).c_str(),

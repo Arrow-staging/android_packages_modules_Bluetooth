@@ -40,6 +40,10 @@ rust_library {
     proc_macros: [
         "libpaste",
     ],
+    apex_available: [
+        "com.android.bluetooth",
+    ],
+    min_sdk_version: "30",
 }
 
 rust_test_host {

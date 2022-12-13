@@ -275,14 +275,15 @@ extern struct acl_peer_supports_sniff_subrating
 struct acl_refresh_remote_address {
   std::function<bool(
       const RawAddress& identity_address, tBLE_ADDR_TYPE identity_address_type,
-      const RawAddress& bda, tBLE_ADDR_TYPE rra_type, const RawAddress& rpa)>
+      const RawAddress& bda, tBTM_SEC_BLE::tADDRESS_TYPE rra_type,
+      const RawAddress& rpa)>
       body{[](const RawAddress& identity_address,
               tBLE_ADDR_TYPE identity_address_type, const RawAddress& bda,
-              tBLE_ADDR_TYPE rra_type,
+              tBTM_SEC_BLE::tADDRESS_TYPE rra_type,
               const RawAddress& rpa) { return false; }};
   bool operator()(const RawAddress& identity_address,
                   tBLE_ADDR_TYPE identity_address_type, const RawAddress& bda,
-                  tBLE_ADDR_TYPE rra_type, const RawAddress& rpa) {
+                  tBTM_SEC_BLE::tADDRESS_TYPE rra_type, const RawAddress& rpa) {
     return body(identity_address, identity_address_type, bda, rra_type, rpa);
   };
 };
@@ -356,6 +357,19 @@ struct acl_get_connection_from_address {
   };
 };
 extern struct acl_get_connection_from_address acl_get_connection_from_address;
+// Name: btm_acl_for_bda
+// Params: const RawAddress& bd_addr, tBT_TRANSPORT transport
+// Returns: tACL_CONN*
+struct btm_acl_for_bda {
+  std::function<tACL_CONN*(const RawAddress& bd_addr, tBT_TRANSPORT transport)>
+      body{[](const RawAddress& bd_addr, tBT_TRANSPORT transport) {
+        return nullptr;
+      }};
+  tACL_CONN* operator()(const RawAddress& bd_addr, tBT_TRANSPORT transport) {
+    return body(bd_addr, transport);
+  };
+};
+extern struct btm_acl_for_bda btm_acl_for_bda;
 // Name: acl_get_connection_from_handle
 // Params: uint16_t handle
 // Returns: tACL_CONN*
@@ -684,10 +698,14 @@ extern struct acl_accept_connection_request acl_accept_connection_request;
 // Params: uint16_t conn_handle, tHCI_STATUS reason
 // Returns: void
 struct acl_disconnect_after_role_switch {
-  std::function<void(uint16_t conn_handle, tHCI_STATUS reason)> body{
-      [](uint16_t conn_handle, tHCI_STATUS reason) { ; }};
-  void operator()(uint16_t conn_handle, tHCI_STATUS reason) {
-    body(conn_handle, reason);
+  std::function<void(uint16_t conn_handle, tHCI_STATUS reason,
+                     std::string comment)>
+      body{[](uint16_t conn_handle, tHCI_STATUS reason, std::string comment) {
+        ;
+      }};
+  void operator()(uint16_t conn_handle, tHCI_STATUS reason,
+                  std::string comment) {
+    body(conn_handle, reason, comment);
   };
 };
 extern struct acl_disconnect_after_role_switch acl_disconnect_after_role_switch;
@@ -695,10 +713,10 @@ extern struct acl_disconnect_after_role_switch acl_disconnect_after_role_switch;
 // Params: uint16_t handle, tHCI_STATUS reason
 // Returns: void
 struct acl_disconnect_from_handle {
-  std::function<void(uint16_t handle, tHCI_STATUS reason)> body{
-      [](uint16_t handle, tHCI_STATUS reason) { ; }};
-  void operator()(uint16_t handle, tHCI_STATUS reason) {
-    body(handle, reason);
+  std::function<void(uint16_t handle, tHCI_STATUS reason, std::string comment)>
+      body{[](uint16_t handle, tHCI_STATUS reason, std::string comment) { ; }};
+  void operator()(uint16_t handle, tHCI_STATUS reason, std::string comment) {
+    body(handle, reason, comment);
   };
 };
 extern struct acl_disconnect_from_handle acl_disconnect_from_handle;
@@ -968,6 +986,20 @@ struct btm_acl_update_conn_addr {
   };
 };
 extern struct btm_acl_update_conn_addr btm_acl_update_conn_addr;
+// Name: btm_configure_data_path
+// Params: uint8_t direction, uint8_t path_id, std::vector<uint8_t>
+// vendor_config Returns: void
+struct btm_configure_data_path {
+  std::function<void(uint8_t direction, uint8_t path_id,
+                     std::vector<uint8_t> vendor_config)>
+      body{[](uint8_t direction, uint8_t path_id,
+              std::vector<uint8_t> vendor_config) { ; }};
+  void operator()(uint8_t direction, uint8_t path_id,
+                  std::vector<uint8_t> vendor_config) {
+    body(direction, path_id, vendor_config);
+  };
+};
+extern struct btm_configure_data_path btm_configure_data_path;
 // Name: btm_acl_update_inquiry_status
 // Params: uint8_t status
 // Returns: void
@@ -1139,15 +1171,6 @@ struct btm_read_remote_features_complete {
 };
 extern struct btm_read_remote_features_complete
     btm_read_remote_features_complete;
-// Name: btm_read_remote_features_complete_raw
-// Params: uint8_t* p
-// Returns: void
-struct btm_read_remote_features_complete_raw {
-  std::function<void(uint8_t* p)> body{[](uint8_t* p) { ; }};
-  void operator()(uint8_t* p) { body(p); };
-};
-extern struct btm_read_remote_features_complete_raw
-    btm_read_remote_features_complete_raw;
 // Name: btm_read_remote_version_complete
 // Params: tHCI_STATUS status, uint16_t handle, uint8_t lmp_version, uint16_t
 // manufacturer, uint16_t lmp_subversion Returns: void
@@ -1162,15 +1185,6 @@ struct btm_read_remote_version_complete {
   };
 };
 extern struct btm_read_remote_version_complete btm_read_remote_version_complete;
-// Name: btm_read_remote_version_complete_raw
-// Params: uint8_t* p
-// Returns: void
-struct btm_read_remote_version_complete_raw {
-  std::function<void(uint8_t* p)> body{[](uint8_t* p) { ; }};
-  void operator()(uint8_t* p) { body(p); };
-};
-extern struct btm_read_remote_version_complete_raw
-    btm_read_remote_version_complete_raw;
 // Name: btm_read_rssi_complete
 // Params: uint8_t* p
 // Returns: void

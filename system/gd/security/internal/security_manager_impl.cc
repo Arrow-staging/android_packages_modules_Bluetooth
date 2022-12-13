@@ -237,7 +237,7 @@ void SecurityManagerImpl::NotifyDeviceUnbonded(hci::AddressWithType device) {
     iter.second->Post(
         common::Bind(&ISecurityManagerListener::OnDeviceUnbonded, common::Unretained(iter.first), device));
   }
-  acl_manager_->RemoveDeviceFromConnectList(device);
+  acl_manager_->RemoveDeviceFromFilterAcceptList(device);
 }
 
 void SecurityManagerImpl::NotifyEncryptionStateChanged(hci::EncryptionChangeView encryption_change_view) {
@@ -701,7 +701,9 @@ void SecurityManagerImpl::OnPairingFinished(security::PairingResultOrFailure pai
     PairingFailure failure = std::get<PairingFailure>(pairing_result);
     LOG_INFO(" ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ failure message: %s",
              failure.message.c_str());
-    NotifyDeviceBondFailed(stored_chan->channel_->GetDevice(), failure);
+    if (stored_chan) {
+      NotifyDeviceBondFailed(stored_chan->channel_->GetDevice(), failure);
+    }
     return;
   }
 
